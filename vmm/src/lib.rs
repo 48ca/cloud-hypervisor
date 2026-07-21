@@ -3347,6 +3347,7 @@ mod unit_tests {
             balloon: None,
             fs: None,
             generic_vhost_user: None,
+            virtio_kvm: None,
             pmem: None,
             serial: SerialConfig {
                 common: CommonConsoleConfig {

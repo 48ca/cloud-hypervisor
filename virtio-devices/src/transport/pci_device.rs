@@ -1139,6 +1139,15 @@ impl PciDevice for VirtioPciDevice {
             bars.push(bar);
         }
 
+        // Add any device-specific BARs
+        for bar in device.get_bars() {
+            if !restoring {
+                self.configuration
+                    .add_pci_bar(&bar)
+                    .map_err(|e| PciDeviceError::IoRegistrationFailed(bar.addr(), e))?;
+            }
+        }
+
         self.bar_regions.clone_from(&bars);
 
         Ok(bars)

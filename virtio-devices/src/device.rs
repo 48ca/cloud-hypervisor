@@ -16,6 +16,7 @@ use std::{cmp, io, result, thread};
 use anyhow::anyhow;
 use libc::EFD_NONBLOCK;
 use log::{error, info, warn};
+use pci::PciBarConfiguration;
 use seccompiler::SeccompAction;
 use virtio_bindings::virtio_config::VIRTIO_F_ACCESS_PLATFORM;
 use virtio_queue::Queue;
@@ -195,6 +196,15 @@ pub trait VirtioDevice: Send {
     /// negotiated with the guest.
     fn access_platform(&self) -> Option<Arc<dyn AccessPlatform>> {
         None
+    }
+
+    /// Returns BAR configurations for bars that are not managed by
+    /// pci_device, but still need to be part of PCI configuration space.
+    /// These are typically used for memory regions like virtio-mem or
+    /// virtio-pmem, or for device-specific needs like virtio-kvm.
+    /// These bars will NOT be added to BusManager/IoManager.
+    fn get_bars(&self) -> Vec<PciBarConfiguration> {
+        Vec::new()
     }
 }
 

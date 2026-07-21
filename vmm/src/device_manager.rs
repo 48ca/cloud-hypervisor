@@ -153,6 +153,7 @@ const DEBUGCON_DEVICE_NAME: &str = "__debug_console";
 const GPIO_DEVICE_NAME: &str = "__gpio";
 const RNG_DEVICE_NAME: &str = "__rng";
 const RTC_DEVICE_NAME: &str = "__rtc";
+const VIRTIO_KVM_DEVICE_NAME: &str = "__kvm";
 const IOMMU_DEVICE_NAME: &str = "__iommu";
 #[cfg(feature = "pvmemcontrol")]
 const PVMEMCONTROL_DEVICE_NAME: &str = "__pvmemcontrol";
@@ -175,6 +176,8 @@ const WATCHDOG_DEVICE_NAME: &str = "__watchdog";
 const VFIO_DEVICE_NAME_PREFIX: &str = "_vfio";
 const VFIO_USER_DEVICE_NAME_PREFIX: &str = "_vfio_user";
 const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
+
+const VIRTIO_KVM_BAR_SIZE: usize = 1usize << 42;
 
 /// Errors associated with device manager
 #[derive(Error, Debug)]
@@ -214,6 +217,10 @@ pub enum DeviceManagerError {
     /// Cannot create generic vhost-user device
     #[error("Cannot create generic vhost-user device")]
     CreateGenericVhostUser(#[source] vhost_user::Error),
+
+    /// Cannot create virtio-kvm device
+    #[error("Cannot create virtio-kvm device")]
+    CreateVirtioKvm(#[source] io::Error),
 
     /// Cannot create virtio-fs device
     #[error("Cannot create virtio-fs device")]
@@ -2647,6 +2654,8 @@ impl DeviceManager {
         // Add generic vhost-user if required
         self.make_generic_vhost_user_devices(snapshot)?;
 
+        self.make_virtio_kvm_devices(snapshot)?;
+
         // Add virtio-fs if required
         self.make_virtio_fs_devices(snapshot)?;
 
@@ -3245,6 +3254,113 @@ impl DeviceManager {
             }
         }
         self.config.lock().unwrap().generic_vhost_user = generic_vhost_user_devices;
+
+        Ok(())
+    }
+
+    fn make_virtio_kvm_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
+        if self.force_access_platform {
+            debug!("virtio-kvm doesn't support iommu; skipping creation");
+            return Ok(());
+        }
+
+        let mut vkvm_config = match self.config.lock().unwrap().virtio_kvm.clone() {
+            Some(config) => config,
+            None => {
+                debug!("No tachyon config specified, skipping creation");
+                return Ok(());
+            }
+        };
+
+        let id = match vkvm_config.pci_common.id.as_ref() {
+            Some(id) => id.clone(),
+            None => vkvm_config
+                .pci_common
+                .id
+                .insert(String::from(VIRTIO_KVM_DEVICE_NAME))
+                .clone(),
+        };
+
+        // Add virtio-kvm
+        info!("Creating virtio-kvm device");
+
+        let guest_bar_addr = self.pci_segments[0]
+            .mem64_allocator
+            .lock()
+            .unwrap()
+            .allocate(None, VIRTIO_KVM_BAR_SIZE as GuestUsize, Some(1 << 30))
+            .ok_or(DeviceManagerError::AllocateMmioAddress)?;
+
+        let bar_region = Arc::new(
+            MmapRegion::build(
+                None,
+                VIRTIO_KVM_BAR_SIZE,
+                libc::PROT_NONE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+            )
+            .map_err(DeviceManagerError::NewMmapRegion)?,
+        );
+        println!(
+            "bar region: guest_bar_addr={:#x} start={:#x}, end={:#x}",
+            { guest_bar_addr.0 },
+            bar_region.as_ptr() as u64,
+            bar_region.as_ptr() as u64 + VIRTIO_KVM_BAR_SIZE as u64
+        );
+
+        let host_addr = bar_region.as_ptr();
+        // Safety: create_userspace_mapping is safe because host_addr points to a valid, active MmapRegion.
+        let mem_slot = unsafe {
+            self.memory_manager
+                .lock()
+                .unwrap()
+                .create_userspace_mapping(
+                    guest_bar_addr.0,
+                    VIRTIO_KVM_BAR_SIZE,
+                    host_addr,
+                    false,
+                    false,
+                    false,
+                )
+                .map_err(DeviceManagerError::MemoryManager)?
+        };
+
+        let bar_mapping = UserspaceMapping {
+            mem_slot,
+            addr: guest_bar_addr,
+            mapping: bar_region.clone(),
+            mergeable: false,
+        };
+
+        let virtio_kvm_device = Arc::new(Mutex::new(
+            virtio_devices::VirtioKvm::new(
+                vkvm_config.socket,
+                id.clone(),
+                self.force_access_platform,
+                self.seccomp_action.clone(),
+                self.exit_evt
+                    .try_clone()
+                    .map_err(DeviceManagerError::EventFd)?,
+                state_from_id(snapshot, id.as_str())
+                    .map_err(DeviceManagerError::RestoreGetState)?,
+                bar_region,
+                bar_mapping,
+            )
+            .map_err(DeviceManagerError::CreateVirtioKvm)?,
+        ));
+        self.virtio_devices.push(MetaVirtioDevice {
+            virtio_device: Arc::clone(&virtio_kvm_device)
+                as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
+            dma_handler: None,
+            pci_common: vkvm_config.pci_common.clone(),
+        });
+
+        // Fill the device tree with a new node. In case of restore, we
+        // know there is nothing to do, so we can simply override the
+        // existing entry.
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), device_node!(id, virtio_kvm_device));
 
         Ok(())
     }

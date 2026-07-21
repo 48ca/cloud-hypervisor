@@ -1,0 +1,22 @@
+[package]
+name = "tachyon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2"
+vmm-sys-util = { workspace = true }
+vm-memory = { workspace = true }
+thiserror = { workspace = true }
+log = { version = "0.4", features = ["std"] }
+flume = "0.11"
+clap = { version = "4.5.13", features = ["derive"] }
+linux-raw-sys = { version = "0.4.15", features = ["ioctl"] }
+prost = "0.13"
+tempfile = "3.10"
+zerocopy = { workspace = true, features = ["derive"] }
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]

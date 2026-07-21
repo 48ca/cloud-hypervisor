@@ -20,6 +20,7 @@ event_monitor = { path = "../event_monitor" }
 hypervisor = { path = "../hypervisor" }
 libc = { workspace = true }
 log = { workspace = true }
+linux-raw-sys = { workspace = true, features = ["ioctl"] }
 mshv-ioctls = { workspace = true, optional = true }
 net_util = { path = "../net_util" }
 pci = { path = "../pci" }
@@ -31,6 +32,7 @@ serde_with = { workspace = true, default-features = false, features = [
 ] }
 serial_buffer = { path = "../serial_buffer" }
 smallvec = { workspace = true }
+tachyon = { path = "../tachyon" }
 thiserror = { workspace = true }
 vhost = { workspace = true, features = [
   "vhost-kern",

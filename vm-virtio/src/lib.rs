@@ -32,6 +32,7 @@ pub enum VirtioDeviceType {
     Rng = 4,
     Balloon = 5,
     Fs9P = 9,
+    Kvm = 11,
     Gpu = 16,
     Rtc = 17,
     Input = 18,
@@ -53,6 +54,7 @@ impl From<u32> for VirtioDeviceType {
             4 => VirtioDeviceType::Rng,
             5 => VirtioDeviceType::Balloon,
             9 => VirtioDeviceType::Fs9P,
+            11 => VirtioDeviceType::Kvm,
             16 => VirtioDeviceType::Gpu,
             17 => VirtioDeviceType::Rtc,
             18 => VirtioDeviceType::Input,
@@ -88,6 +90,7 @@ impl fmt::Display for VirtioDeviceType {
             VirtioDeviceType::Fs => "fs",
             VirtioDeviceType::Pmem => "pmem",
             VirtioDeviceType::Watchdog => "watchdog",
+            VirtioDeviceType::Kvm => "kvm",
             VirtioDeviceType::Unknown => "UNKNOWN",
         };
         write!(f, "{output}")

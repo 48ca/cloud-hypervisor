@@ -1,0 +1,97 @@
+// Copyright 2026 Google LLC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package tachyon_state;
+
+message MemoryFileState {
+    uint64 id = 1;
+    string luo_id = 2;
+    uint64 size = 3;
+}
+
+message VmState {
+    uint64 id = 1;
+    // Mappings of guest memory, referencing MemoryFile handle IDs
+    message MemoryRegion {
+        uint32 slot = 1;
+        uint32 flags = 2;
+        uint64 guest_phys_addr = 3;
+        uint64 memory_size = 4;
+        uint64 guest_memfd = 5;
+        uint64 guest_memfd_offset = 6;
+        uint64 userspace_addr = 7;
+    }
+    repeated MemoryRegion regions = 2;
+
+    message IrqChip {
+        uint32 chip_id = 1;
+        bytes chip = 2; // kvm_irqchip
+    }
+    repeated IrqChip irqchips = 3;
+    bytes msr_filter = 4; // kvm_msr_filter (including bitmaps)
+    bool has_irqchip = 5;
+    repeated uint64 eventfds = 6;
+    string luo_id = 7;
+    bool has_pit = 8;
+    bytes pit_config = 9; // kvm_pit_config
+    bytes pit_state = 10; // kvm_pit_state2
+    repeated bytes enabled_caps = 11; // kvm_enable_cap
+    bytes gsi_routing = 12; // kvm_irq_routing
+
+    message Ioeventfd {
+        bytes config = 1; // kvm_ioeventfd
+        uint64 eventfd_handle = 2;
+    }
+    repeated Ioeventfd ioeventfds_configs = 13;
+
+    message Irqfd {
+        bytes config = 1; // kvm_irqfd
+        uint64 eventfd_handle = 2;
+        uint64 resamplefd_handle = 3;
+    }
+    repeated Irqfd irqfds_configs = 14;
+    uint64 tss_addr = 15;
+    uint64 identity_map_addr = 16;
+    bytes pmu_event_filter = 17; // kvm_pmu_event_filter
+    bytes clock = 18; // kvm_clock_data
+}
+
+message VcpuState {
+    uint64 id = 1;
+    uint64 vm_id = 2;
+    // VCPU state retrieved via KVM ioctls
+    bytes regs = 3;
+    bytes sregs = 4;
+    bytes fpu = 5;
+    bytes cpuid = 6;
+    bytes lapic = 7;
+    bytes xsave = 8;
+    bytes xcrs = 9;
+    bytes debugregs = 10;
+    bytes events = 11;
+    bytes mp_state = 12;
+    uint32 vcpu_id = 13;
+    bytes msrs = 14;
+    bytes nested_state = 15;
+    uint64 tsc = 16;
+    bytes sregs2 = 17;
+}
+
+message EventfdState {
+    uint64 id = 1;
+    string luo_id = 2;
+}
+
+message RpcServerState {
+    uint64 id = 1;
+    string luo_id = 2;
+    string socket_path = 3;
+}
+
+message RpcChannelState {
+    uint64 id = 1;
+    string luo_id = 2;
+}

@@ -78,6 +78,12 @@ pub enum Error {
     /// Generic vhost-user queue size missing
     #[error("Error parsing --generic-vhost-user: queue size missing")]
     ParseGenericVhostUserQueueSizeMissing,
+    /// Error parsing virtio-kvm options.
+    #[error("Error parsing --virtio-kvm")]
+    ParseVirtioKvm(#[source] OptionParserError),
+    /// Error parsing virtio-kvm socket parameter.
+    #[error("Error parsing --virtio-kvm: socket missing")]
+    ParseVirtioKvmSockMissing,
     /// Missing persistent memory file parameter.
     #[error("Error parsing --pmem: file missing")]
     ParsePmemFileMissing,
@@ -487,6 +493,7 @@ pub struct VmParams<'a> {
     pub balloon: Option<&'a str>,
     pub fs: Option<Vec<&'a str>>,
     pub generic_vhost_user: Option<Vec<&'a str>>,
+    pub virtio_kvm: Option<&'a str>,
     pub pmem: Option<Vec<&'a str>>,
     pub serial: &'a str,
     pub console: &'a str,
@@ -552,6 +559,7 @@ impl<'a> VmParams<'a> {
         let generic_vhost_user: Option<Vec<&str>> = args
             .get_many::<String>("generic-vhost-user")
             .map(|x| x.map(|y| y as &str).collect());
+        let virtio_kvm = args.get_one::<String>("virtio-kvm").map(|x| x as &str);
         let pmem: Option<Vec<&str>> = args
             .get_many::<String>("pmem")
             .map(|x| x.map(|y| y as &str).collect());
@@ -608,6 +616,7 @@ impl<'a> VmParams<'a> {
             balloon,
             fs,
             generic_vhost_user,
+            virtio_kvm,
             pmem,
             serial,
             console,
@@ -2124,6 +2133,37 @@ impl GenericVhostUserConfig {
     }
 }
 
+impl VirtioKvmConfig {
+    pub const SYNTAX: &'static str = "virtio-kvm parameters \
+    socket=<socket_path>,\
+    id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+
+    pub fn parse(virtio_kvm: &str) -> Result<Self> {
+        let mut parser = OptionParser::new();
+        parser.add("socket").add_all(PciDeviceCommonConfig::OPTIONS);
+        parser.parse(virtio_kvm).map_err(Error::ParseVirtioKvm)?;
+
+        let socket = parser
+            .get("socket")
+            .ok_or(Error::ParseVirtioKvmSockMissing)?;
+
+        let pci_common = PciDeviceCommonConfig::parse(virtio_kvm)?;
+
+        Ok(VirtioKvmConfig {
+            pci_common,
+            socket: socket.into(),
+        })
+    }
+
+    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        if self.pci_common.iommu {
+            return Err(ValidationError::IommuNotSupported);
+        }
+
+        self.pci_common.validate(vm_config)
+    }
+}
+
 impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
     \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
@@ -3545,6 +3585,11 @@ impl VmConfig {
             generic_vhost_user = Some(generic_vhost_user_config_list);
         }
 
+        let mut virtio_kvm: Option<VirtioKvmConfig> = None;
+        if let Some(virtio_kvm_str) = &vm_params.virtio_kvm {
+            virtio_kvm = Some(VirtioKvmConfig::parse(virtio_kvm_str)?);
+        }
+
         let mut pmem: Option<Vec<PmemConfig>> = None;
         if let Some(pmem_list) = &vm_params.pmem {
             let mut pmem_config_list = Vec::new();
@@ -3692,6 +3737,7 @@ impl VmConfig {
             user_devices,
             vdpa,
             vsock,
+            virtio_kvm,
             #[cfg(feature = "pvmemcontrol")]
             pvmemcontrol,
             pvpanic: vm_params.pvpanic,
@@ -3825,6 +3871,7 @@ impl Clone for VmConfig {
             pvmemcontrol: self.pvmemcontrol.clone(),
             fs: self.fs.clone(),
             generic_vhost_user: self.generic_vhost_user.clone(),
+            virtio_kvm: self.virtio_kvm.clone(),
             pmem: self.pmem.clone(),
             serial: self.serial.clone(),
             console: self.console.clone(),
@@ -5171,6 +5218,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             disks: None,
             rng: RngConfig::default(),
             generic_vhost_user: None,
+            virtio_kvm: None,
             balloon: None,
             fs: None,
             pmem: None,
@@ -5416,6 +5464,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             balloon: None,
             fs: None,
             generic_vhost_user: None,
+            virtio_kvm: None,
             pmem: None,
             serial: SerialConfig {
                 common: CommonConsoleConfig {

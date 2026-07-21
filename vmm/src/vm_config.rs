@@ -618,6 +618,20 @@ impl ApplyLandlock for GenericVhostUserConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct VirtioKvmConfig {
+    #[serde(flatten)]
+    pub pci_common: PciDeviceCommonConfig,
+    pub socket: PathBuf,
+}
+
+impl ApplyLandlock for VirtioKvmConfig {
+    fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
+        landlock.add_rule_with_access(&self.socket, "rw")?;
+        Ok(())
+    }
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PmemConfig {
@@ -1166,6 +1180,7 @@ pub struct VmConfig {
     pub rng: RngConfig,
     pub balloon: Option<BalloonConfig>,
     pub generic_vhost_user: Option<Vec<GenericVhostUserConfig>>,
+    pub virtio_kvm: Option<VirtioKvmConfig>,
     pub fs: Option<Vec<FsConfig>>,
     pub pmem: Option<Vec<PmemConfig>>,
     #[serde(default)]
@@ -1248,6 +1263,10 @@ impl VmConfig {
             for generic_vhost_user_config in generic_vhost_user_configs.iter() {
                 generic_vhost_user_config.apply_landlock(&mut landlock)?;
             }
+        }
+
+        if let Some(virtio_kvm_config) = &self.virtio_kvm {
+            virtio_kvm_config.apply_landlock(&mut landlock)?;
         }
 
         if let Some(pmem_configs) = &self.pmem {

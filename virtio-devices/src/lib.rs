@@ -27,6 +27,7 @@ mod iommu;
 pub mod mem;
 pub mod net;
 mod pmem;
+pub mod queue_sync;
 mod rng;
 mod rtc;
 pub mod seccomp_filters;
@@ -34,6 +35,7 @@ mod thread_helper;
 pub mod transport;
 pub mod vdpa;
 pub mod vhost_user;
+pub mod virtio_kvm;
 pub mod vsock;
 pub mod watchdog;
 
@@ -55,9 +57,11 @@ pub use self::iommu::{AccessPlatformMapping, Iommu, IommuMapping};
 pub use self::mem::{BlocksState, Mem, VIRTIO_MEM_ALIGN_SIZE, VirtioMemMappingSource};
 pub use self::net::{Net, NetCtrlEpollHandler};
 pub use self::pmem::Pmem;
+pub use self::queue_sync::QueueSync;
 pub use self::rng::Rng;
 pub use self::rtc::Rtc;
 pub use self::vdpa::{Vdpa, VdpaDmaMapping};
+pub use self::virtio_kvm::VirtioKvm;
 pub use self::vsock::Vsock;
 pub use self::watchdog::Watchdog;
 
