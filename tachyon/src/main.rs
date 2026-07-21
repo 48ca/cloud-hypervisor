@@ -23,6 +23,10 @@ struct Args {
     /// Path to the state image file for restoration
     #[arg(short, long)]
     restore: Option<String>,
+
+    /// Path to VM configuration proto.
+    #[arg(long)]
+    vm_config: Option<String>,
 }
 
 struct Logger {
