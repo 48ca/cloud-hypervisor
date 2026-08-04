@@ -1410,54 +1410,14 @@ impl VirtioKvmEpollHandler {
             }
             vfio::VFIO_IOMMU_MAP_DMA => self.handle_iommu_map_dma(container, req),
             vfio::VFIO_IOMMU_UNMAP_DMA => self.handle_iommu_unmap_dma(container, req),
-            vfio::VFIO_IOMMU_GET_INFO => self.handle_inout_ioctl::<vfio::vfio_iommu_type1_info, _>(
-                container,
-                req,
-                "VFIO_IOMMU_GET_INFO",
-            ),
+            vfio::VFIO_IOMMU_GET_INFO => {
+                self.handle_vfio_argsz_ioctl(container, req, "VFIO_IOMMU_GET_INFO", 16)
+            }
             _ => {
                 debug!("!! virtio_kvm: handle_vfio_container_ioctl: unknown ioctl: {ioctl_num:#x}");
                 VirtioKvmResp::from_errno(libc::EINVAL)
             }
         }
-    }
-
-    fn handle_get_irq_info(
-        &self,
-        device: &VirtioKvmVfioDevice,
-        req: &VirtioKvmReq,
-    ) -> VirtioKvmResp {
-        let gpa = GuestAddress::new(req.longarg);
-        let mem = self.mem.memory();
-        let irqs_hdr: vfio::vfio_irq_info = match mem.read_obj(gpa) {
-            Ok(irqs) => irqs,
-            Err(_) => return VirtioKvmResp::from_errno(libc::EFAULT),
-        };
-
-        let mut sz = irqs_hdr.argsz as usize;
-        if sz == 0 {
-            sz = size_of::<vfio::vfio_irq_info>();
-        }
-
-        let mut args = vec![0u8; sz];
-        if mem.read_slice(&mut args, gpa).is_err() {
-            return VirtioKvmResp::from_errno(libc::EFAULT);
-        }
-
-        // For eventfds, the driver has already done the translation.
-        let ret = unsafe {
-            libc::ioctl(
-                device.fd,
-                vfio::VFIO_DEVICE_GET_IRQ_INFO as _,
-                args.as_ptr(),
-            )
-        };
-        if ret != 0 {
-            return VirtioKvmResp::from_last_errno();
-        }
-
-        let _ = mem.write_slice(&args, gpa);
-        VirtioKvmResp::success()
     }
 
     fn handle_iommu_map_dma(
@@ -1666,11 +1626,9 @@ impl VirtioKvmEpollHandler {
         let ioctl_num = req.arg;
         match ioctl_num {
             vfio::VFIO_GROUP_UNSET_CONTAINER => self.handle_generic_ioctl(group, req),
-            vfio::VFIO_GROUP_GET_STATUS => self.handle_inout_ioctl::<vfio::vfio_group_status, _>(
-                group,
-                req,
-                "VFIO_GROUP_GET_STATUS",
-            ),
+            vfio::VFIO_GROUP_GET_STATUS => {
+                self.handle_vfio_argsz_ioctl(group, req, "VFIO_GROUP_GET_STATUS", 8)
+            }
             vfio::VFIO_GROUP_SET_CONTAINER => self.handle_vfio_group_set_container(group, req),
             vfio::VFIO_GROUP_GET_DEVICE_FD => self.handle_vfio_group_get_device_fd(group, req),
             _ => {
@@ -1768,19 +1726,16 @@ impl VirtioKvmEpollHandler {
         debug!("!! virtio_kvm: handle_vfio_device_ioctl: req: {req:#?}");
         let ioctl_num = req.arg;
         match ioctl_num {
-            vfio::VFIO_DEVICE_GET_INFO => self.handle_inout_ioctl::<vfio::vfio_device_info, _>(
-                device,
-                req,
-                "VFIO_DEVICE_GET_INFO",
-            ),
-            vfio::VFIO_DEVICE_GET_REGION_INFO => self
-                .handle_inout_ioctl::<vfio::vfio_region_info, _>(
-                    device,
-                    req,
-                    "VFIO_DEVICE_GET_REGION_INFO",
-                ),
+            vfio::VFIO_DEVICE_GET_INFO => {
+                self.handle_vfio_argsz_ioctl(device, req, "VFIO_DEVICE_GET_INFO", 16)
+            }
+            vfio::VFIO_DEVICE_GET_REGION_INFO => {
+                self.handle_vfio_argsz_ioctl(device, req, "VFIO_DEVICE_GET_REGION_INFO", 32)
+            }
             vfio::VFIO_DEVICE_RESET => self.handle_generic_ioctl(device, req),
-            vfio::VFIO_DEVICE_GET_IRQ_INFO => self.handle_get_irq_info(device, req),
+            vfio::VFIO_DEVICE_GET_IRQ_INFO => {
+                self.handle_vfio_argsz_ioctl(device, req, "VFIO_DEVICE_GET_IRQ_INFO", 16)
+            }
             vfio::VFIO_DEVICE_SET_IRQS => self.handle_device_set_irqs(device, req),
             _ => {
                 debug!("!! virtio_kvm: handle_vfio_device_ioctl: unknown ioctl: {ioctl_num:#x}");
@@ -2124,6 +2079,54 @@ impl VirtioKvmEpollHandler {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
+                }
+                if resp.status == 0 {
+                    VirtioKvmResp::success()
+                } else {
+                    VirtioKvmResp::from_errno(resp.status as i32)
+                }
+            }
+            Err(e) => {
+                error!("virtio-kvm: {name} RPC failed: {e}");
+                VirtioKvmResp::from_errno(libc::EIO)
+            }
+        }
+    }
+
+    /// Dispatches a VFIO ioctl that uses an extensible structure starting with `argsz`.
+    /// Dynamically determines the buffer size from guest memory, honoring historical UAPI minimum sizes.
+    fn handle_vfio_argsz_ioctl<R: TachyonResource>(
+        &self,
+        resource: &R,
+        req: &VirtioKvmReq,
+        name: &str,
+        min_size: usize,
+    ) -> VirtioKvmResp {
+        debug!("!! virtio_kvm: handle_vfio_argsz_ioctl: {name}");
+        let mem = self.mem.memory();
+        let gpa = GuestAddress::new(req.longarg);
+        let mut hdr = [0u8; 4];
+        if mem.read_slice(&mut hdr, gpa).is_err() {
+            return VirtioKvmResp::from_errno(libc::EFAULT);
+        }
+        let argsz = u32::from_ne_bytes(hdr) as usize;
+        let len = argsz.max(min_size);
+        if len > 1024 * 1024 {
+            return VirtioKvmResp::from_errno(libc::EINVAL);
+        }
+        let mut body = vec![0u8; len];
+        if mem.read_slice(&mut body, gpa).is_err() {
+            return VirtioKvmResp::from_errno(libc::EFAULT);
+        }
+
+        let msg = Message::ioctl(resource.tachyon_handle(), req.arg, 0)
+            .with_body(body)
+            .with_resp(len as u32);
+        match self.tachyon.call(msg) {
+            Ok(resp) => {
+                if !resp.body.is_empty() {
+                    let write_len = resp.body.len().min(len);
+                    let _ = mem.write_slice(&resp.body[..write_len], gpa);
                 }
                 if resp.status == 0 {
                     VirtioKvmResp::success()

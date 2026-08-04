@@ -1814,6 +1814,25 @@ impl Drop for VmOps {
     }
 }
 
+/// Validates that an incoming VFIO ioctl message meets the minimum buffer requirements
+/// and that any requested `argsz` does not exceed the provided message buffer size.
+/// This prevents kernel out-of-bounds writes into user space during pointer ioctl execution.
+fn validate_vfio_argsz(msg: &Message, min_size: usize) -> Result<(), u64> {
+    if msg.body.len() < min_size || (msg.resp_size > 0 && (msg.resp_size as usize) < min_size) {
+        return Err(libc::EINVAL as u64);
+    }
+    if msg.body.len() >= 4 {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&msg.body[0..4]);
+        let argsz = u32::from_ne_bytes(bytes) as usize;
+        let buffer_size = std::cmp::max(msg.body.len(), msg.resp_size as usize);
+        if argsz > buffer_size {
+            return Err(libc::EINVAL as u64);
+        }
+    }
+    Ok(())
+}
+
 pub struct VfioContainerOps {}
 
 impl Default for VfioContainerOps {
@@ -1835,10 +1854,14 @@ impl VfioContainerOps {
         _channel: &Arc<rpc::Channel>,
     ) -> Option<Message> {
         match msg.cmd {
-            vfio::VFIO_GET_API_VERSION
-            | vfio::VFIO_SET_IOMMU
-            | vfio::VFIO_IOMMU_GET_INFO
-            | vfio::VFIO_CHECK_EXTENSION => {
+            vfio::VFIO_IOMMU_GET_INFO => {
+                if let Err(err) = validate_vfio_argsz(msg, 16) {
+                    return Some(Message::reply(msg).with_error(err));
+                }
+                let longarg = !msg.body.is_empty() || msg.resp_size > 0;
+                Some(handle.ioctl(msg, longarg))
+            }
+            vfio::VFIO_GET_API_VERSION | vfio::VFIO_SET_IOMMU | vfio::VFIO_CHECK_EXTENSION => {
                 let longarg = !msg.body.is_empty() || msg.resp_size > 0;
                 Some(handle.ioctl(msg, longarg))
             }
@@ -1959,7 +1982,14 @@ impl VfioGroupOps {
         _channel: &Arc<rpc::Channel>,
     ) -> Option<Message> {
         match msg.cmd {
-            vfio::VFIO_GROUP_UNSET_CONTAINER | vfio::VFIO_GROUP_GET_STATUS => {
+            vfio::VFIO_GROUP_GET_STATUS => {
+                if let Err(err) = validate_vfio_argsz(msg, 8) {
+                    return Some(Message::reply(msg).with_error(err));
+                }
+                let longarg = !msg.body.is_empty() || msg.resp_size > 0;
+                Some(handle.ioctl(msg, longarg))
+            }
+            vfio::VFIO_GROUP_UNSET_CONTAINER => {
                 let longarg = !msg.body.is_empty() || msg.resp_size > 0;
                 Some(handle.ioctl(msg, longarg))
             }
@@ -2081,6 +2111,9 @@ impl VfioDeviceOps {
         system: &Arc<System>,
         msg: &Message,
     ) -> Option<Message> {
+        if let Err(err) = validate_vfio_argsz(msg, std::mem::size_of::<vfio::vfio_irq_set>()) {
+            return Some(Message::reply(msg).with_error(err));
+        }
         trace!("VFIO_DEVICE_SET_IRQS: {:?}", msg.body);
         let translated_msg = match Self::vfio_set_irqs_translate(msg, system) {
             Ok(msg) => msg,
@@ -2101,9 +2134,28 @@ impl VfioDeviceOps {
     ) -> Option<Message> {
         match msg.cmd {
             vfio::VFIO_DEVICE_SET_IRQS => self.handle_vfio_device_set_irqs(handle, system, msg),
-            vfio::VFIO_DEVICE_GET_INFO
-            | vfio::VFIO_DEVICE_GET_REGION_INFO
-            | vfio::VFIO_DEVICE_RESET => {
+            vfio::VFIO_DEVICE_GET_INFO => {
+                if let Err(err) = validate_vfio_argsz(msg, 16) {
+                    return Some(Message::reply(msg).with_error(err));
+                }
+                let longarg = !msg.body.is_empty() || msg.resp_size > 0;
+                Some(handle.ioctl(msg, longarg))
+            }
+            vfio::VFIO_DEVICE_GET_REGION_INFO => {
+                if let Err(err) = validate_vfio_argsz(msg, 32) {
+                    return Some(Message::reply(msg).with_error(err));
+                }
+                let longarg = !msg.body.is_empty() || msg.resp_size > 0;
+                Some(handle.ioctl(msg, longarg))
+            }
+            vfio::VFIO_DEVICE_GET_IRQ_INFO => {
+                if let Err(err) = validate_vfio_argsz(msg, 16) {
+                    return Some(Message::reply(msg).with_error(err));
+                }
+                let longarg = !msg.body.is_empty() || msg.resp_size > 0;
+                Some(handle.ioctl(msg, longarg))
+            }
+            vfio::VFIO_DEVICE_RESET => {
                 let longarg = !msg.body.is_empty() || msg.resp_size > 0;
                 Some(handle.ioctl(msg, longarg))
             }
@@ -5960,5 +6012,66 @@ mod tests {
         unsafe {
             libc::munmap(shm_ptr as *mut libc::c_void, shm_size);
         }
+    }
+
+    #[test]
+    fn test_validate_vfio_argsz_valid() {
+        let min_size = 32;
+        let mut msg = Message {
+            msg_type: Operation::Ioctl as u32,
+            request_id: 1,
+            handle: 1,
+            status: 0,
+            arg: 0,
+            cmd: vfio::VFIO_DEVICE_GET_REGION_INFO,
+            resp_size: 32,
+            body: vec![0u8; 32],
+            fds: None,
+        };
+        let valid_argsz: u32 = 32;
+        msg.body[0..4].copy_from_slice(&valid_argsz.to_ne_bytes());
+        assert!(validate_vfio_argsz(&msg, min_size).is_ok());
+    }
+
+    #[test]
+    fn test_validate_vfio_argsz_too_small() {
+        let min_size = 32;
+        let msg = Message {
+            msg_type: Operation::Ioctl as u32,
+            request_id: 1,
+            handle: 1,
+            status: 0,
+            arg: 0,
+            cmd: vfio::VFIO_DEVICE_GET_REGION_INFO,
+            resp_size: 32,
+            body: vec![0u8; 16],
+            fds: None,
+        };
+        assert_eq!(
+            validate_vfio_argsz(&msg, min_size),
+            Err(libc::EINVAL as u64)
+        );
+    }
+
+    #[test]
+    fn test_validate_vfio_argsz_out_of_bounds() {
+        let min_size = 32;
+        let mut msg = Message {
+            msg_type: Operation::Ioctl as u32,
+            request_id: 1,
+            handle: 1,
+            status: 0,
+            arg: 0,
+            cmd: vfio::VFIO_DEVICE_GET_REGION_INFO,
+            resp_size: 32,
+            body: vec![0u8; 32],
+            fds: None,
+        };
+        let invalid_argsz: u32 = 40;
+        msg.body[0..4].copy_from_slice(&invalid_argsz.to_ne_bytes());
+        assert_eq!(
+            validate_vfio_argsz(&msg, min_size),
+            Err(libc::EINVAL as u64)
+        );
     }
 }
