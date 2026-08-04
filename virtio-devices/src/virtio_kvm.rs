@@ -859,6 +859,17 @@ impl AsRawFd for VirtioKvmResource {
 }
 
 impl VirtioKvmResource {
+    fn tachyon_handle(&self) -> Option<u64> {
+        match self {
+            VirtioKvmResource::Vm(vm) => Some(vm.tachyon_handle),
+            VirtioKvmResource::Vcpu(vcpu) => Some(vcpu.tachyon_handle),
+            VirtioKvmResource::VfioContainer(container) => Some(container.tachyon_handle),
+            VirtioKvmResource::VfioGroup(group) => Some(group.tachyon_handle),
+            VirtioKvmResource::VfioDevice(device) => Some(device.tachyon_handle),
+            _ => None,
+        }
+    }
+
     fn new_system() -> Result<Self, ErrnoError> {
         match kvm_ioctls::Kvm::new() {
             Ok(kvm) => Ok(VirtioKvmResource::System(kvm)),
@@ -1443,20 +1454,16 @@ impl VirtioKvmEpollHandler {
         dma_map.iova = umap.iova;
         dma_map.size = umap.size;
 
-        // The guest supplied the GPA of the memory file in region.userspace_addr.
         let file_gpa = GuestAddress::new(umap.vaddr);
-        match self.resolve_memory_file(file_gpa, umap.size, |file, offset| {
-            dma_map.vaddr =
-                self.bar_mapping
-                    .mapping
-                    .as_ptr()
-                    .wrapping_add(file.phys_offset as usize + offset) as u64;
-        }) {
-            Ok(_) => {}
-            Err(e) => {
-                return e;
-            }
-        }
+        let (_, _, offset_in_bar) = match self.resolve_bar_resource(file_gpa, umap.size) {
+            Ok(res) => res,
+            Err(e) => return e,
+        };
+        dma_map.vaddr = self
+            .bar_mapping
+            .mapping
+            .as_ptr()
+            .wrapping_add(offset_in_bar as usize) as u64;
 
         debug!("translated guest dma_map: {dma_map:#x?}");
 
@@ -1744,10 +1751,11 @@ impl VirtioKvmEpollHandler {
         }
     }
 
-    fn resolve_memory_file<F>(&self, gpa: GuestAddress, len: u64, f: F) -> Result<(), VirtioKvmResp>
-    where
-        F: FnOnce(&KvmMemoryFile, usize),
-    {
+    fn resolve_bar_resource(
+        &self,
+        gpa: GuestAddress,
+        len: u64,
+    ) -> Result<(u64, u64, u64), VirtioKvmResp> {
         if gpa < self.bar_mapping.addr
             || gpa.raw_value() + len
                 > self.bar_mapping.addr.raw_value() + self.bar_mapping.mapping.size() as u64
@@ -1757,19 +1765,37 @@ impl VirtioKvmEpollHandler {
 
         let userspace_offset_in_bar = gpa.raw_value() - self.bar_mapping.addr.raw_value();
 
-        let mem_files = self.mem_files.lock().unwrap();
-        for file in mem_files.values() {
-            if userspace_offset_in_bar >= file.phys_offset
-                && userspace_offset_in_bar + len <= file.phys_offset + file.size
-            {
-                let offset_in_file = userspace_offset_in_bar - file.phys_offset;
-                return {
-                    f(file, offset_in_file as usize);
-                    Ok(())
-                };
+        {
+            let mem_files = self.mem_files.lock().unwrap();
+            for file in mem_files.values() {
+                if userspace_offset_in_bar >= file.phys_offset
+                    && userspace_offset_in_bar + len <= file.phys_offset + file.size
+                {
+                    let offset_in_file = userspace_offset_in_bar - file.phys_offset;
+                    return Ok((file.tachyon_handle, offset_in_file, userspace_offset_in_bar));
+                }
             }
         }
-        debug!("!! virtio_kvm: no memory file found for offset {userspace_offset_in_bar:#x}");
+
+        {
+            let mappings = self.mappings.lock().unwrap();
+            let resources = self.resources.lock().unwrap();
+            for (handle, mapping) in mappings.iter() {
+                if userspace_offset_in_bar >= mapping.phys_offset
+                    && userspace_offset_in_bar + len <= mapping.phys_offset + mapping.size
+                    && let Some(resource) = resources.get(handle)
+                    && let Some(tachyon_handle) = resource.lock().unwrap().tachyon_handle()
+                {
+                    let offset_in_resource =
+                        mapping.device_offset + (userspace_offset_in_bar - mapping.phys_offset);
+                    return Ok((tachyon_handle, offset_in_resource, userspace_offset_in_bar));
+                }
+            }
+        }
+
+        debug!(
+            "!! virtio_kvm: no memory file or BAR mapping found for offset {userspace_offset_in_bar:#x}"
+        );
         Err(VirtioKvmResp::from_errno(libc::ENOENT))
     }
 
@@ -1791,43 +1817,16 @@ impl VirtioKvmEpollHandler {
             region2.flags = region.flags;
             region2.memory_size = region.memory_size;
 
-            // The guest supplied the GPA of the memory file in region.userspace_addr.
             let file_gpa = GuestAddress::new(region.userspace_addr);
-            match self.resolve_memory_file(file_gpa, region.memory_size, |file, offset| {
-                region2.guest_memfd = file.tachyon_handle as u32;
-                region2.guest_memfd_offset = offset as u64;
-            }) {
-                Ok(_) => {}
-                Err(e) => {
-                    return e;
-                }
-            }
+            let (tachyon_handle, offset_in_resource, _) =
+                match self.resolve_bar_resource(file_gpa, region.memory_size) {
+                    Ok(res) => res,
+                    Err(e) => return e,
+                };
 
-            let userspace_offset_in_bar = region.userspace_addr - self.bar_mapping.addr.raw_value();
-
-            let mem_files = self.mem_files.lock().unwrap();
-            let mut found_file = None;
-            for file in mem_files.values() {
-                if userspace_offset_in_bar >= file.phys_offset
-                    && userspace_offset_in_bar + region.memory_size <= file.phys_offset + file.size
-                {
-                    found_file = Some(file);
-                    break;
-                }
-            }
-
-            let file = match found_file {
-                Some(f) => f,
-                None => {
-                    debug!(
-                        "!! virtio_kvm: set_user_memory_region: no memory file found for offset {userspace_offset_in_bar:#x}"
-                    );
-                    return VirtioKvmResp::from_errno(libc::ENOENT);
-                }
-            };
-
-            guest_memfd_handle = file.tachyon_handle;
-            region2.guest_memfd_offset = userspace_offset_in_bar - file.phys_offset;
+            guest_memfd_handle = tachyon_handle;
+            region2.guest_memfd = tachyon_handle as u32;
+            region2.guest_memfd_offset = offset_in_resource;
         }
 
         debug!("translated guest region2: {region2:#x?}, handle: 0x{guest_memfd_handle:x}");
