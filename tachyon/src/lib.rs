@@ -2062,11 +2062,11 @@ impl VfioDeviceOps {
     ) -> Result<Message, std::io::Error> {
         let body = &msg.body;
         unsafe {
-            let meta = body.as_ptr() as *const vfio::vfio_irq_set;
+            let meta = (body.as_ptr() as *const vfio::vfio_irq_set).read_unaligned();
 
             let mut new_msg = msg.clone();
 
-            if ((*meta).flags & vfio::VFIO_IRQ_SET_DATA_EVENTFD) == 0 {
+            if (meta.flags & vfio::VFIO_IRQ_SET_DATA_EVENTFD) == 0 {
                 return Ok(new_msg);
             }
 
@@ -2075,8 +2075,8 @@ impl VfioDeviceOps {
             let body_fds = body.clone();
             let handles = body.as_ptr().add(hdr_sz) as *const u64;
             let fds = body_fds.as_ptr().add(hdr_sz) as *mut i32;
-            for i in 0usize..(*meta).count as usize {
-                let handle = *handles.add(i);
+            for i in 0usize..meta.count as usize {
+                let handle = handles.add(i).read_unaligned();
                 if handle == 0 {
                     continue;
                 }
@@ -2098,7 +2098,7 @@ impl VfioDeviceOps {
                         )));
                     }
                 };
-                *fds.add(i) = fd;
+                fds.add(i).write_unaligned(fd);
             }
             new_msg.body = body_fds;
             Ok(new_msg)

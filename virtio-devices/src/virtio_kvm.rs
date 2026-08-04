@@ -1650,17 +1650,18 @@ impl VirtioKvmEpollHandler {
         set: *mut vfio::vfio_irq_set,
     ) -> Result<(), io::Error> {
         unsafe {
-            if ((*set).flags & vfio::VFIO_IRQ_SET_DATA_EVENTFD) == 0 {
+            let hdr = set.read_unaligned();
+            if (hdr.flags & vfio::VFIO_IRQ_SET_DATA_EVENTFD) == 0 {
                 return Ok(());
             }
 
             let hdr_sz = size_of::<vfio::vfio_irq_set>();
 
             let handles = (set as *mut u8).add(hdr_sz) as *mut u64;
-            for i in 0usize..(*set).count as usize {
-                let handle = *handles.add(i);
+            for i in 0usize..hdr.count as usize {
+                let handle = handles.add(i).read_unaligned();
                 match self.resolve_eventfd(handle) {
-                    Some(tachyon_handle) => *handles.add(i) = tachyon_handle,
+                    Some(tachyon_handle) => handles.add(i).write_unaligned(tachyon_handle),
                     None => {
                         return Err(io::Error::other(format!(
                             "Couldn't resolve tachyon handle {handle}"
