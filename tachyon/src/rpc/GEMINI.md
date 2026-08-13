@@ -10,7 +10,7 @@ This document defines the foundational principles and technical requirements for
     - Partial reads/writes are considered protocol errors.
 
 ## 2. Protocol Specification
-- **Header Format**: Every message starts with a fixed-size 56-byte header:
+- **Header Format**: Every message starts with a fixed-size 64-byte header:
     - `u32 type`: Identifies the command or message category.
     - `u32 size`: The size of the message body in bytes (excluding header).
     - `u64 request_id`: A unique identifier for matching responses to requests.
@@ -19,8 +19,9 @@ This document defines the foundational principles and technical requirements for
     - `u64 arg`: General purpose argument for the command.
     - `u64 cmd`: Specific sub-command or ioctl number.
     - `u32 resp_size`: Expected response body size.
-    - `u32 padding`: Reserved for alignment.
-- **Body**: A binary payload following the header, with a maximum size defined by `MAX_MESSAGE_SIZE - HEADER_SIZE`.
+    - `u32 padding1`: Reserved for alignment.
+    - `u64 padding2`: Reserved for alignment (ensures 64-byte fixed size).
+- **Body**: A binary payload following the header, with a maximum size defined by `MAX_MESSAGE_SIZE - MESSAGE_HEADER_SIZE`.
 - **FD Passing**: File descriptors must be transferred using Unix domain socket control messages (`SCM_RIGHTS`).
 
 ## 3. Concurrency & Thread Safety
