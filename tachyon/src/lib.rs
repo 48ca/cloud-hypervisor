@@ -235,6 +235,8 @@ pub trait HandleOps: Send + Sync {
     fn get_type(&self) -> HandleType;
 }
 
+pub const INVALID_HANDLE: u64 = u64::MAX;
+
 pub struct Handle {
     id: u64,
     fd: Option<OwnedFd>,
@@ -1943,8 +1945,8 @@ impl VfioGroupOps {
             let handles = system.handles.lock().unwrap();
             handles.get(&{ msg.arg }).cloned().unwrap()
         };
-        let fd = if let Some(fd) = container_handle.fd.as_ref() {
-            fd.as_raw_fd() as u64
+        let fd: i32 = if let Some(fd) = container_handle.fd.as_ref() {
+            fd.as_raw_fd()
         } else {
             debug!(
                 "VfioGroupOps: VFIO_GROUP_SET_CONTAINER found an invalid container for handle {}",
@@ -1952,8 +1954,8 @@ impl VfioGroupOps {
             );
             return Some(Message::reply(msg).with_error(libc::EINVAL as u64));
         };
-        // VFIO requires a pointer to the fd to passed.
-        let container_fd_ptr = &fd as *const u64;
+        // VFIO requires a pointer to the int fd to be passed.
+        let container_fd_ptr = &fd as *const i32;
         let ret = unsafe {
             libc::ioctl(
                 handle.fd.as_ref().unwrap().as_raw_fd(),
@@ -2061,9 +2063,12 @@ impl VfioDeviceOps {
         system: &Arc<System>,
     ) -> Result<Message, std::io::Error> {
         let body = &msg.body;
-        unsafe {
-            let meta = (body.as_ptr() as *const vfio::vfio_irq_set).read_unaligned();
+        if body.len() < size_of::<vfio::vfio_irq_set>() {
+            return Err(std::io::Error::other("Body too small for vfio_irq_set"));
+        }
 
+        unsafe {
+            let mut meta = (body.as_ptr() as *const vfio::vfio_irq_set).read_unaligned();
             let mut new_msg = msg.clone();
 
             if (meta.flags & vfio::VFIO_IRQ_SET_DATA_EVENTFD) == 0 {
@@ -2071,20 +2076,23 @@ impl VfioDeviceOps {
             }
 
             let hdr_sz = size_of::<vfio::vfio_irq_set>();
+            if body.len() < hdr_sz + (meta.count as usize) * size_of::<u64>() {
+                return Err(std::io::Error::other("Body too small for eventfd handles"));
+            }
 
-            let body_fds = body.clone();
             let handles = body.as_ptr().add(hdr_sz) as *const u64;
-            let fds = body_fds.as_ptr().add(hdr_sz) as *mut i32;
-            for i in 0usize..meta.count as usize {
+            let mut fds_vec = vec![-1i32; meta.count as usize];
+
+            for (i, fd_slot) in fds_vec.iter_mut().enumerate() {
                 let handle = handles.add(i).read_unaligned();
-                if handle == 0 {
+                if handle == INVALID_HANDLE {
                     continue;
                 }
                 let evfd = match system.get_handle(handle) {
                     Some(evfd) => evfd,
                     None => {
                         return Err(std::io::Error::other(format!(
-                            "Unknown handle {:x}",
+                            "Unknown eventfd handle {:x}",
                             handle
                         )));
                     }
@@ -2098,9 +2106,19 @@ impl VfioDeviceOps {
                         )));
                     }
                 };
-                fds.add(i).write_unaligned(fd);
+                *fd_slot = fd;
             }
-            new_msg.body = body_fds;
+
+            meta.argsz = (hdr_sz + fds_vec.len() * size_of::<i32>()) as u32;
+
+            let mut final_body = Vec::with_capacity(meta.argsz as usize);
+            let meta_slice = std::slice::from_raw_parts(&meta as *const _ as *const u8, hdr_sz);
+            final_body.extend_from_slice(meta_slice);
+            for fd in fds_vec {
+                final_body.extend_from_slice(&fd.to_ne_bytes());
+            }
+
+            new_msg.body = final_body;
             Ok(new_msg)
         }
     }

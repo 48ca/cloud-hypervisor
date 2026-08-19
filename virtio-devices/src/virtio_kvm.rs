@@ -31,7 +31,7 @@ use pci::{PciBarConfiguration, PciBarPrefetchable, PciBarRegionType};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use tachyon::rpc::{Client, Message, RpcClient};
-use tachyon::{Operation as TachyonOp, kvm, vfio};
+use tachyon::{INVALID_HANDLE, Operation as TachyonOp, kvm, vfio};
 use thiserror::Error;
 use virtio_queue::{Queue, QueueT};
 use vm_device::UserspaceMapping;
@@ -1660,6 +1660,9 @@ impl VirtioKvmEpollHandler {
             let handles = (set as *mut u8).add(hdr_sz) as *mut u64;
             for i in 0usize..hdr.count as usize {
                 let handle = handles.add(i).read_unaligned();
+                if handle == INVALID_HANDLE {
+                    continue;
+                }
                 match self.resolve_eventfd(handle) {
                     Some(tachyon_handle) => handles.add(i).write_unaligned(tachyon_handle),
                     None => {
@@ -2982,6 +2985,10 @@ impl VirtioKvmEpollHandler {
 
         if let Some(info) = eventfds.get_mut(&ctx) {
             info.refs += 1;
+            debug!(
+                "virtio-kvm: handle_eventfd_get: existing ctx={ctx}, refs={}, tachyon_handle={}",
+                info.refs, info.tachyon_handle
+            );
             return VirtioKvmResp::from_data(ctx);
         }
 
@@ -3015,6 +3022,10 @@ impl VirtioKvmEpollHandler {
                         tachyon_handle,
                     };
                     eventfds.insert(ctx, info);
+                    debug!(
+                        "virtio-kvm: handle_eventfd_get: created ctx={ctx}, tachyon_handle={tachyon_handle}, fd={fd}, total_eventfds={}",
+                        eventfds.len()
+                    );
                     VirtioKvmResp::from_data(ctx)
                 } else {
                     VirtioKvmResp::from_errno(resp.status as i32)
@@ -3033,7 +3044,9 @@ impl VirtioKvmEpollHandler {
         match eventfds.entry(handle) {
             Entry::Occupied(mut entry) => {
                 entry.get_mut().refs -= 1;
-                if entry.get().refs == 0 {
+                let refs = entry.get().refs;
+                debug!("virtio-kvm: handle_eventfd_put: handle={handle}, remaining_refs={refs}");
+                if refs == 0 {
                     let info = entry.remove();
                     let fd = info.eventfd.as_raw_fd();
                     fd_to_handle.remove(&fd);
@@ -3051,7 +3064,10 @@ impl VirtioKvmEpollHandler {
                 }
                 VirtioKvmResp::success()
             }
-            Entry::Vacant(_) => VirtioKvmResp::from_errno(libc::ENOENT),
+            Entry::Vacant(_) => {
+                debug!("virtio-kvm: handle_eventfd_put: handle={handle} not found in eventfds");
+                VirtioKvmResp::from_errno(libc::ENOENT)
+            }
         }
     }
 
