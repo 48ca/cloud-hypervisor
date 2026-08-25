@@ -13,8 +13,12 @@ use tachyon::rpc::Server;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the RPC socket
-    #[arg(short, long, default_value = "/tmp/tachyon.sock")]
-    socket: String,
+    #[arg(short, long)]
+    socket: Option<String>,
+
+    /// Partition identifier (UID)
+    #[arg(long, default_value_t = 0)]
+    partition_id: u64,
 
     /// Sets the level of debugging output
     #[arg(short, action = ArgAction::Count)]
@@ -81,6 +85,20 @@ impl log::Log for Logger {
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
+    let socket_path = match args.socket {
+        Some(s) => {
+            let p = std::path::Path::new(&s);
+            if p.is_dir() {
+                p.join(format!("{}.sock", args.partition_id))
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                s
+            }
+        }
+        None => format!("/tmp/{}.sock", args.partition_id),
+    };
+
     let log_level = match args.verbose {
         0 => LevelFilter::Warn,
         1 => LevelFilter::Info,
@@ -98,11 +116,11 @@ fn main() -> std::io::Result<()> {
         .expect("Failed to initialize logger");
 
     warn!(
-        "Starting tachyon VMM version 2.0-RPC-HANDOVER on {}",
-        args.socket
+        "Starting tachyon VMM version 2.0-RPC-HANDOVER for partition {} on {}",
+        args.partition_id, socket_path
     );
 
-    let server = Server::new(&args.socket)?;
+    let server = Server::new(&socket_path)?;
 
     let system = if let Some(image_path) = &args.restore {
         warn!("Waiting for an initial client connection to provide state FD...");
@@ -125,7 +143,7 @@ fn main() -> std::io::Result<()> {
         None,
         None,
         std::sync::Arc::new(RpcServerOps {
-            socket_path: args.socket.clone(),
+            socket_path: socket_path.clone(),
             luo_id: luo_preserve(server.as_raw_fd()),
         }),
     );

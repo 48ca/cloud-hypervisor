@@ -2135,7 +2135,7 @@ impl GenericVhostUserConfig {
 
 impl VirtioKvmConfig {
     pub const SYNTAX: &'static str = "virtio-kvm parameters \
-    socket=<socket_path>,\
+    socket=<socket_dir>,\
     id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(virtio_kvm: &str) -> Result<Self> {
