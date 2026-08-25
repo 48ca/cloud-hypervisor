@@ -116,6 +116,7 @@ Tachyon prioritizes performance and clarity in its logging strategy. Adherence t
 ## 12. Design Documentation
 Detailed architectural designs and implementation plans for complex subsystems are maintained in the `docs/` directory:
 
+- **Multi-Partition Tachyon Design** ([docs/MULTI_PARTITION_TACHYON_DESIGN.md](docs/MULTI_PARTITION_TACHYON_DESIGN.md)): Architecture and design for supporting multiple isolated Tachyon partitions and dynamic `/dev/kvm-<partition-id>` devices.
 - **Polling Design** ([docs/KVM_RUN_POLLING_DESIGN.md](docs/KVM_RUN_POLLING_DESIGN.md)): High-performance polling scheme for `KVM_RUN` to bypass RPC overhead.
 - **State Preservation & Restoration (S/R)** ([docs/SR_DESIGN.md](docs/SR_DESIGN.md)): Unified design for state preservation across host `kexec` and seamless Live Update.
 - **S/R Implementation Plan** ([docs/wip/sr_implementation_plan.md](docs/wip/sr_implementation_plan.md)): Detailed roadmap and checklist for the S/R feature implementation.
