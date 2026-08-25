@@ -15,6 +15,8 @@ linux-raw-sys = { version = "0.4.15", features = ["ioctl"] }
 prost = "0.13"
 tempfile = "3.10"
 zerocopy = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [build-dependencies]
 prost-build = "0.13"

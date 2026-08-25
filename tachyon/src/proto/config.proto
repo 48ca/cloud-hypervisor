@@ -1,0 +1,33 @@
+// Copyright 2026 Google LLC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package tachyon_config;
+
+message MemoryDescriptor {
+  enum MemoryType {
+    ANONYMOUS = 0;
+    TMPFS = 1;
+    HUGETLBFS = 2;
+    PMEM = 3;
+  }
+  optional MemoryType type = 1;
+  repeated string path = 2;
+}
+
+message NumaNode {
+  optional int32 id = 1;
+  repeated uint64 cpu = 2;
+  optional MemoryDescriptor memory = 3;
+
+  message VfioDevice {
+    optional uint64 group = 1;
+  }
+  repeated VfioDevice vfio_devices = 4;
+}
+
+message VmOptions {
+  repeated NumaNode nodes = 1;
+}

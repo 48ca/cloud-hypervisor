@@ -28,9 +28,9 @@ struct Args {
     #[arg(short, long)]
     restore: Option<String>,
 
-    /// Path to VM configuration proto.
-    #[arg(long)]
-    vm_config: Option<String>,
+    /// Path to the partition configuration proto file
+    #[arg(short, long)]
+    config: Option<String>,
 }
 
 struct Logger {
@@ -85,6 +85,13 @@ impl log::Log for Logger {
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
+    let partition_config = if let Some(config_path) = &args.config {
+        let cfg = tachyon::Config::from_file(config_path)?;
+        Some(cfg)
+    } else {
+        None
+    };
+
     let socket_path = match args.socket {
         Some(s) => {
             let p = std::path::Path::new(&s);
@@ -130,9 +137,10 @@ fn main() -> std::io::Result<()> {
         let mut file = std::fs::File::open(image_path)?;
         let system = System::new_empty();
         System::restore(&system, &mut file, channel.clone())?;
+        system.set_config(partition_config);
         system
     } else {
-        System::new()?
+        System::new_with_config(partition_config)?
     };
 
     // Register the initial server as a handle

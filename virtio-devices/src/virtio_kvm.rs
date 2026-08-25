@@ -216,6 +216,7 @@ enum Operation {
     Ready,
     OpenVfioContainer,
     OpenVfioGroup,
+    VfioGetGroups,
 }
 
 impl TryFrom<u64> for Operation {
@@ -239,6 +240,7 @@ impl TryFrom<u64> for Operation {
             13 => Ok(Operation::Ready),
             64 => Ok(Operation::OpenVfioContainer),
             65 => Ok(Operation::OpenVfioGroup),
+            68 => Ok(Operation::VfioGetGroups),
             _ => Err(()),
         }
     }
@@ -1361,12 +1363,13 @@ impl VirtioKvmEpollHandler {
 
     fn handle_open_vfio_group(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
         let partition_id = req.arg;
+        let group_id = req.longarg;
         if let Err(e) = self.tachyon.prepare_partition(self, partition_id) {
             debug!("!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}");
             return VirtioKvmResp::from_errno(libc::EIO);
         }
 
-        let msg = Message::new(TachyonOp::OpenVfioGroup as u32, 1, 0, req.arg);
+        let msg = Message::new(TachyonOp::OpenVfioGroup as u32, 1, 0, group_id);
 
         let resp = match self.tachyon.call_partition(partition_id, msg) {
             Ok(r) => r,
@@ -1418,6 +1421,38 @@ impl VirtioKvmEpollHandler {
         );
 
         VirtioKvmResp::from_data(group_fd as u64)
+    }
+
+    fn handle_vfio_get_groups(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
+        let partition_id = req.arg;
+        let buf_gpa = req.longarg;
+        if let Err(e) = self.tachyon.prepare_partition(self, partition_id) {
+            debug!("!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}");
+            return VirtioKvmResp::from_errno(libc::EIO);
+        }
+
+        let msg = Message::simple(TachyonOp::VfioGetGroups as u32, 1);
+        let resp = match self.tachyon.call_partition(partition_id, msg) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("virtio-kvm: VfioGetGroups RPC failed: {e}");
+                return VirtioKvmResp::from_errno(libc::EIO);
+            }
+        };
+
+        if resp.status != 0 {
+            return VirtioKvmResp::from_errno(resp.status as i32);
+        }
+
+        if buf_gpa != 0 && !resp.body.is_empty() {
+            let mem = self.mem.memory();
+            if let Err(e) = mem.write_slice(&resp.body, GuestAddress(buf_gpa)) {
+                error!("virtio-kvm: failed to write VFIO groups to guest GPA: {e}");
+                return VirtioKvmResp::from_errno(libc::EFAULT);
+            }
+        }
+
+        VirtioKvmResp::from_data(resp.arg)
     }
 
     fn handle_msrs_ioctl(
@@ -3815,6 +3850,7 @@ impl VirtioKvmEpollHandler {
             Operation::Ready => Some(self.handle_ready(req)),
             Operation::OpenVfioContainer => Some(self.handle_open_vfio_container(req)),
             Operation::OpenVfioGroup => Some(self.handle_open_vfio_group(req)),
+            Operation::VfioGetGroups => Some(self.handle_vfio_get_groups(req)),
         }
     }
 

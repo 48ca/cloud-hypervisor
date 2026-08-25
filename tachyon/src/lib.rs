@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod config;
 pub mod kvm;
 pub mod rpc;
 pub mod state;
@@ -14,6 +15,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub use config::Config;
 use log::{debug, error, trace, warn};
 use rpc::Message;
 use vmm_sys_util::ioctl;
@@ -150,6 +152,7 @@ pub enum Operation {
     NotifyLiveUpdate = 14,
     OpenVfioContainer = 15,
     OpenVfioGroup = 16,
+    VfioGetGroups = 17,
     Unknown = u32::MAX,
 }
 
@@ -194,6 +197,7 @@ impl From<u32> for Operation {
             14 => Operation::NotifyLiveUpdate,
             15 => Operation::OpenVfioContainer,
             16 => Operation::OpenVfioGroup,
+            17 => Operation::VfioGetGroups,
             _ => Operation::Unknown,
         }
     }
@@ -3663,6 +3667,18 @@ impl HandleOps for KvmDeviceOps {
                 Some(self.handle_open_vfio_container(handle, system, msg))
             }
             Operation::OpenVfioGroup => Some(self.handle_open_vfio_group(handle, system, msg)),
+            Operation::VfioGetGroups => {
+                let config = system.config();
+                let groups = config.as_ref().map(|c| c.vfio_groups()).unwrap_or_default();
+                let mut resp = Message::reply(msg);
+                resp.arg = groups.len() as u64;
+                let mut body = Vec::with_capacity(groups.len() * 8);
+                for g in groups {
+                    body.extend_from_slice(&g.to_le_bytes());
+                }
+                resp.body = body;
+                Some(resp)
+            }
             Operation::Ioctl => self.handle_ioctl(handle, system, msg),
             Operation::EventfdGet => {
                 let mut resp = Message::reply(msg);
@@ -3774,6 +3790,7 @@ pub struct System {
     handles: Mutex<HashMap<u64, Arc<Handle>>>,
     state: std::sync::atomic::AtomicU32,
     rpc_thread_pool: Mutex<Option<Arc<rpc::RpcThreadPool>>>,
+    config: Mutex<Option<Config>>,
 }
 
 impl System {
@@ -3818,6 +3835,7 @@ impl System {
             handles: Mutex::new(HashMap::new()),
             state: std::sync::atomic::AtomicU32::new(SystemState::Running as u32),
             rpc_thread_pool: Mutex::new(None),
+            config: Mutex::new(None),
         })
     }
 
@@ -3917,7 +3935,22 @@ impl System {
             handles: Mutex::new(handles),
             state: std::sync::atomic::AtomicU32::new(SystemState::Running as u32),
             rpc_thread_pool: Mutex::new(None),
+            config: Mutex::new(None),
         }))
+    }
+
+    pub fn new_with_config(config: Option<Config>) -> std::io::Result<Arc<Self>> {
+        let system = Self::new()?;
+        *system.config.lock().unwrap() = config;
+        Ok(system)
+    }
+
+    pub fn config(&self) -> Option<Config> {
+        self.config.lock().unwrap().clone()
+    }
+
+    pub fn set_config(&self, config: Option<Config>) {
+        *self.config.lock().unwrap() = config;
     }
 
     pub fn handle_channel(self: &Arc<Self>, channel: Arc<rpc::Channel>, handle_id: Option<u64>) {
@@ -6091,5 +6124,60 @@ mod tests {
             validate_vfio_argsz(&msg, min_size),
             Err(libc::EINVAL as u64)
         );
+    }
+
+    #[test]
+    fn test_tachyon_config() {
+        use config::tachyon_config::numa_node::VfioDevice;
+        use config::tachyon_config::{MemoryDescriptor, NumaNode, VmOptions};
+        use prost::Message;
+
+        let config = VmOptions {
+            nodes: vec![
+                NumaNode {
+                    id: Some(0),
+                    cpu: vec![0, 1],
+                    memory: Some(MemoryDescriptor {
+                        r#type: Some(1), // TMPFS
+                        path: vec!["/dev/shm".to_string()],
+                    }),
+                    vfio_devices: vec![
+                        VfioDevice { group: Some(27) },
+                        VfioDevice { group: Some(28) },
+                    ],
+                },
+                NumaNode {
+                    id: Some(1),
+                    cpu: vec![2, 3],
+                    memory: None,
+                    vfio_devices: vec![VfioDevice { group: Some(29) }],
+                },
+            ],
+        };
+
+        assert_eq!(config.vfio_groups(), vec![27, 28, 29]);
+
+        let mut buf = Vec::new();
+        config.encode(&mut buf).unwrap();
+
+        let decoded = VmOptions::decode(&buf[..]).unwrap();
+        assert_eq!(decoded.vfio_groups(), vec![27, 28, 29]);
+
+        let system = System::new_empty();
+        assert!(system.config().is_none());
+        system.set_config(Some(decoded.clone()));
+        assert_eq!(system.config().unwrap().vfio_groups(), vec![27, 28, 29]);
+
+        // Test JSON parsing format
+        let json = r#"{"nodes": [{"id": 0, "vfio_devices": [{"group": 27}, {"group": 28}]}]}"#;
+        let cfg_json = Config::parse_from_json(json).unwrap();
+        assert_eq!(cfg_json.vfio_groups(), vec![27, 28]);
+
+        // Test from_bytes with JSON and binary
+        let from_json = Config::from_bytes(json.as_bytes()).unwrap();
+        assert_eq!(from_json.vfio_groups(), vec![27, 28]);
+
+        let from_bin = Config::from_bytes(&buf).unwrap();
+        assert_eq!(from_bin.vfio_groups(), vec![27, 28, 29]);
     }
 }

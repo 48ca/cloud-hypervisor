@@ -457,18 +457,36 @@ syntax = "proto3";
 
 package tachyon_config;
 
-message Config {
-  // Assigned host VFIO device groups
-  message VFIO {
-    repeated uint64 groups = 1;
+message MemoryDescriptor {
+  enum MemoryType {
+    ANONYMOUS = 0;
+    TMPFS = 1;
+    HUGETLBFS = 2;
+    PMEM = 3;
   }
-  VFIO vfio = 1;
+  optional MemoryType type = 1;
+  repeated string path = 2;
+}
+
+message NumaNode {
+  optional int32 id = 1;
+  repeated uint64 cpu = 2;
+  optional MemoryDescriptor memory = 3;
+
+  message VfioDevice {
+    optional uint64 group = 1;
+  }
+  repeated VfioDevice vfio_devices = 4;
+}
+
+message VmOptions {
+  repeated NumaNode nodes = 1;
 }
 ```
 
 #### Key Aspects:
-- **Startup Loading**: `tachyon/src/main.rs` parses the binary proto into `tachyon::Config` and sets `System::config`.
-- **Group Restricting & Advertising**: The `System` registry uses the configured groups to answer `VfioGetGroups` RPCs, informing Dom0 about the specific device groups allocated to the partition.
+- **Startup Loading**: `tachyon/src/main.rs` parses the JSON or binary proto into `tachyon::VmOptions` (aliased as `tachyon::Config`) and sets `System::config`.
+- **Group Restricting & Advertising**: The `System` registry aggregates all VFIO devices across all configured NUMA nodes via `VmOptions::vfio_groups()` to answer `VfioGetGroups` RPCs, informing Dom0 about the specific device groups allocated to the partition.
 
 ---
 
