@@ -555,13 +555,21 @@ impl TachyonConnection {
         });
     }
 
+    pub fn prepare_all_connections(&self, virtio_kvm: &VirtioKvmEpollHandler) {
+        let partitions = self.partitions.lock().unwrap();
+        for conn in partitions.values() {
+            Self::prepare_connection(conn, virtio_kvm);
+        }
+    }
+
     pub fn prepare_partition(
         &self,
         virtio_kvm: &VirtioKvmEpollHandler,
         partition_id: u64,
     ) -> io::Result<()> {
         let mut partitions = self.partitions.lock().unwrap();
-        if partitions.contains_key(&partition_id) {
+        if let Some(conn) = partitions.get(&partition_id) {
+            Self::prepare_connection(conn, virtio_kvm);
             return Ok(());
         }
         let sock_path = self.socket_for_partition(partition_id);
@@ -582,6 +590,7 @@ impl TachyonConnection {
         Ok(client)
     }
 
+    #[allow(dead_code)]
     pub fn call(&self, msg: Message) -> io::Result<Message> {
         self.call_partition(0, msg)
     }
@@ -3919,18 +3928,27 @@ impl EpollHelperHandler for VirtioKvmEpollHandler {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum VirtioKvmResourceTypeState {
-    System,
+    System {
+        #[serde(default)]
+        partition_id: u64,
+    },
     Vm {
         tachyon_handle: u64,
         shm_bar_offset: u64,
+        #[serde(default)]
+        partition_id: u64,
     },
     Vcpu {
         vcpu_id: u32,
         vm_handle: u64,
         tachyon_handle: u64,
+        #[serde(default)]
+        partition_id: u64,
     },
     Stats {
         parent_handle: u64,
+        #[serde(default)]
+        partition_id: u64,
     },
 }
 
@@ -3955,6 +3973,8 @@ pub struct KvmMemoryFileState {
     pub size: u64,
     pub phys_offset: u64,
     pub tachyon_handle: u64,
+    #[serde(default)]
+    pub partition_id: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -4026,9 +4046,11 @@ impl VirtioKvm {
                     body: Vec::new(),
                     fds: None,
                 };
-                let resp = tachyon.call(msg).map_err(|e| {
-                    io::Error::other(format!("Failed to get FD for memory file: {e}"))
-                })?;
+                let resp = tachyon
+                    .call_partition(file_state.partition_id, msg)
+                    .map_err(|e| {
+                        io::Error::other(format!("Failed to get FD for memory file: {e}"))
+                    })?;
                 if resp.status != 0 {
                     return Err(io::Error::other(format!(
                         "Failed to get FD for memory file status={}",
@@ -4066,7 +4088,7 @@ impl VirtioKvm {
                     size: file_state.size,
                     phys_offset: file_state.phys_offset,
                     tachyon_handle: file_state.tachyon_handle,
-                    partition_id: 0,
+                    partition_id: file_state.partition_id,
                 };
                 mem_files.lock().unwrap().insert(file_state.handle, file);
             }
@@ -4079,7 +4101,7 @@ impl VirtioKvm {
 
             for res_state in &state.resources {
                 match &res_state.resource_type {
-                    VirtioKvmResourceTypeState::System => system_states.push(res_state),
+                    VirtioKvmResourceTypeState::System { .. } => system_states.push(res_state),
                     VirtioKvmResourceTypeState::Vm { .. } => vm_states.push(res_state),
                     VirtioKvmResourceTypeState::Vcpu { .. } => vcpu_states.push(res_state),
                     VirtioKvmResourceTypeState::Stats { .. } => stats_states.push(res_state),
@@ -4088,7 +4110,11 @@ impl VirtioKvm {
 
             // Restore System
             for res_state in system_states {
-                let system_res = VirtioKvmResource::new_system(0).map_err(|e| {
+                let partition_id = match &res_state.resource_type {
+                    VirtioKvmResourceTypeState::System { partition_id } => *partition_id,
+                    _ => 0,
+                };
+                let system_res = VirtioKvmResource::new_system(partition_id).map_err(|e| {
                     io::Error::other(format!("Failed to create KVM system resource: {e}"))
                 })?;
                 resources
@@ -4102,6 +4128,7 @@ impl VirtioKvm {
                 if let VirtioKvmResourceTypeState::Vm {
                     tachyon_handle,
                     shm_bar_offset,
+                    partition_id,
                 } = &res_state.resource_type
                 {
                     let msg = Message {
@@ -4116,7 +4143,7 @@ impl VirtioKvm {
                         fds: None,
                     };
                     let resp = tachyon
-                        .call(msg)
+                        .call_partition(*partition_id, msg)
                         .map_err(|e| io::Error::other(format!("Failed to get FDs for VM: {e}")))?;
                     if resp.status != 0 {
                         return Err(io::Error::other(format!(
@@ -4141,7 +4168,7 @@ impl VirtioKvm {
                         shm_fd,
                         tachyon_handle: *tachyon_handle,
                         shm_bar_offset: Arc::new(AtomicU64::new(*shm_bar_offset)),
-                        partition_id: 0,
+                        partition_id: *partition_id,
                     };
                     resources.lock().unwrap().insert(
                         Handle(res_state.handle),
@@ -4156,6 +4183,7 @@ impl VirtioKvm {
                     vcpu_id,
                     vm_handle,
                     tachyon_handle,
+                    partition_id,
                 } = &res_state.resource_type
                 {
                     let msg = Message {
@@ -4170,7 +4198,7 @@ impl VirtioKvm {
                         fds: None,
                     };
                     let resp = tachyon
-                        .call(msg)
+                        .call_partition(*partition_id, msg)
                         .map_err(|e| io::Error::other(format!("Failed to get FD for VCPU: {e}")))?;
                     if resp.status != 0 {
                         return Err(io::Error::other(format!(
@@ -4189,7 +4217,7 @@ impl VirtioKvm {
                         vm_handle: Handle(*vm_handle),
                         tachyon_handle: *tachyon_handle,
                         tachyon: tachyon.clone(),
-                        partition_id: 0,
+                        partition_id: *partition_id,
                     };
                     resources.lock().unwrap().insert(
                         Handle(res_state.handle),
@@ -4200,8 +4228,10 @@ impl VirtioKvm {
 
             // Restore Stats
             for res_state in stats_states {
-                if let VirtioKvmResourceTypeState::Stats { parent_handle } =
-                    &res_state.resource_type
+                if let VirtioKvmResourceTypeState::Stats {
+                    parent_handle,
+                    partition_id,
+                } = &res_state.resource_type
                 {
                     let parent_tachyon_handle = {
                         let resources_guard = resources.lock().unwrap();
@@ -4236,7 +4266,7 @@ impl VirtioKvm {
                         body: Vec::new(),
                         fds: None,
                     };
-                    let resp = tachyon.call(msg).map_err(|e| {
+                    let resp = tachyon.call_partition(*partition_id, msg).map_err(|e| {
                         io::Error::other(format!("Failed to get stats FD from Tachyon: {e}"))
                     })?;
                     if resp.status != 0 {
@@ -4253,7 +4283,7 @@ impl VirtioKvm {
                     let stats = VirtioKvmStats {
                         fd: stats_fd,
                         parent_handle: Handle(*parent_handle),
-                        partition_id: 0,
+                        partition_id: *partition_id,
                     };
                     resources.lock().unwrap().insert(
                         Handle(res_state.handle),
@@ -4374,18 +4404,23 @@ impl VirtioKvm {
         for (handle, resource_lock) in resources_guard.iter() {
             let resource_guard = resource_lock.lock().unwrap();
             let resource_type = match resource_guard.deref() {
-                VirtioKvmResource::System(_) => VirtioKvmResourceTypeState::System,
+                VirtioKvmResource::System(sys) => VirtioKvmResourceTypeState::System {
+                    partition_id: sys.partition_id,
+                },
                 VirtioKvmResource::Vm(vm) => VirtioKvmResourceTypeState::Vm {
                     tachyon_handle: vm.tachyon_handle,
                     shm_bar_offset: vm.shm_bar_offset.load(Ordering::Acquire),
+                    partition_id: vm.partition_id,
                 },
                 VirtioKvmResource::Vcpu(vcpu) => VirtioKvmResourceTypeState::Vcpu {
                     vcpu_id: vcpu.vcpu_id,
                     vm_handle: vcpu.vm_handle.0,
                     tachyon_handle: vcpu.tachyon_handle,
+                    partition_id: vcpu.partition_id,
                 },
                 VirtioKvmResource::Stats(stats) => VirtioKvmResourceTypeState::Stats {
                     parent_handle: stats.parent_handle.0,
+                    partition_id: stats.partition_id,
                 },
                 VirtioKvmResource::VfioContainer(_)
                 | VirtioKvmResource::VfioGroup(_)
@@ -4416,6 +4451,7 @@ impl VirtioKvm {
                 size: file.size,
                 phys_offset: file.phys_offset,
                 tachyon_handle: file.tachyon_handle,
+                partition_id: file.partition_id,
             });
         }
 
@@ -4578,6 +4614,9 @@ impl VirtioDevice for VirtioKvm {
             poll_work_sender: sender,
             tachyon: self.tachyon.clone(),
         };
+
+        // Attach live-update notification handlers to all existing partition connections (e.g. after restore)
+        self.tachyon.prepare_all_connections(&handler);
 
         let paused = self.common.paused.clone();
         let paused_sync = self.common.paused_sync.clone();
