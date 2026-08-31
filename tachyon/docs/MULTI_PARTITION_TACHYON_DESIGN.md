@@ -139,7 +139,7 @@ The `virtio-kvm` device running in the L0 hypervisor acts as the intermediary be
 #[derive(Clone)]
 pub struct TachyonConnection {
     socket_dir: PathBuf,
-    partitions: Arc<Mutex<HashMap<u64 /* partition_id */, Arc<RpcClient>>>>,
+    partitions: Arc<Mutex<HashMap<u64 /* partition_id */, TachyonPartition>>>,
 }
 
 impl TachyonConnection {
@@ -154,37 +154,39 @@ impl TachyonConnection {
         self.socket_dir.join(format!("{partition_id}.sock"))
     }
 
-    pub fn get_for_partition(&self, partition_id: u64) -> io::Result<Arc<RpcClient>> {
-        let mut partitions = self.partitions.lock().unwrap();
-        if let Some(client) = partitions.get(&partition_id) {
-            return Ok(client.clone());
-        }
-        let sock_path = self.socket_for_partition(partition_id);
-        let client = Arc::new(Self::connect(&sock_path)?);
-        partitions.insert(partition_id, client.clone());
-        Ok(client)
-    }
-
     pub fn prepare_partition(
         &self,
         virtio_kvm: &VirtioKvmEpollHandler,
         partition_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<TachyonPartition> {
         let mut partitions = self.partitions.lock().unwrap();
-        if let Some(conn) = partitions.get(&partition_id) {
-            Self::prepare_connection(conn, virtio_kvm);
-            return Ok(());
+        if let Some(partition) = partitions.get(&partition_id) {
+            Self::prepare_connection(partition.client(), virtio_kvm);
+            return Ok(partition.clone());
         }
         let sock_path = self.socket_for_partition(partition_id);
         let new_conn = Arc::new(Self::connect(&sock_path)?);
         Self::prepare_connection(&new_conn, virtio_kvm);
-        partitions.insert(partition_id, new_conn);
-        Ok(())
+        let partition = TachyonPartition::new(partition_id, new_conn);
+        partitions.insert(partition_id, partition.clone());
+        Ok(partition)
+    }
+
+    pub fn get_partition(&self, partition_id: u64) -> io::Result<TachyonPartition> {
+        let mut partitions = self.partitions.lock().unwrap();
+        if let Some(partition) = partitions.get(&partition_id) {
+            return Ok(partition.clone());
+        }
+        let sock_path = self.socket_for_partition(partition_id);
+        let client = Arc::new(Self::connect(&sock_path)?);
+        let partition = TachyonPartition::new(partition_id, client);
+        partitions.insert(partition_id, partition.clone());
+        Ok(partition)
     }
 
     pub fn call_partition(&self, partition_id: u64, msg: Message) -> io::Result<Message> {
-        let conn = self.get_for_partition(partition_id)?;
-        conn.call(msg)
+        let partition = self.get_partition(partition_id)?;
+        partition.call(msg)
     }
 }
 ```

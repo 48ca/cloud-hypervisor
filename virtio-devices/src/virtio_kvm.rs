@@ -416,12 +416,55 @@ struct VirtioKvmIrqfd {
 // SAFETY: it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioKvmIrqfd {}
 
+#[derive(Clone)]
+pub struct TachyonPartition {
+    pub partition_id: u64,
+    pub client: Arc<RpcClient>,
+}
+
+impl fmt::Debug for TachyonPartition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TachyonPartition")
+            .field("partition_id", &self.partition_id)
+            .finish()
+    }
+}
+
+impl TachyonPartition {
+    pub fn new(partition_id: u64, client: Arc<RpcClient>) -> Self {
+        TachyonPartition {
+            partition_id,
+            client,
+        }
+    }
+
+    pub fn partition_id(&self) -> u64 {
+        self.partition_id
+    }
+
+    pub fn client(&self) -> &Arc<RpcClient> {
+        &self.client
+    }
+
+    pub fn call(&self, msg: Message) -> io::Result<Message> {
+        self.client.call(msg)
+    }
+
+    pub fn asynchronous_call(&self, msg: Message) -> io::Result<()> {
+        self.client.asynchronous_call(msg)
+    }
+
+    pub fn fail_pending_requests(&self) {
+        self.client.fail_pending_requests();
+    }
+}
+
 struct KvmMemoryFile {
     fd: RawFd,
     size: u64,
     phys_offset: u64,
     tachyon_handle: u64,
-    partition_id: u64,
+    partition: TachyonPartition,
 }
 
 impl Drop for KvmMemoryFile {
@@ -454,7 +497,7 @@ struct EventfdInfo {
     eventfd: EventFd,
     refs: u32,
     tachyon_handle: u64,
-    partition_id: u64,
+    partition: TachyonPartition,
 }
 
 impl AsRawFd for EventfdInfo {
@@ -492,7 +535,7 @@ type MemFiles = HashMap<u64, KvmMemoryFile>;
 #[derive(Clone)]
 struct TachyonConnection {
     socket_dir: PathBuf,
-    partitions: Arc<Mutex<HashMap<u64, Arc<RpcClient>>>>,
+    partitions: Arc<Mutex<HashMap<u64, TachyonPartition>>>,
 }
 
 impl TachyonConnection {
@@ -559,8 +602,8 @@ impl TachyonConnection {
 
     pub fn prepare_all_connections(&self, virtio_kvm: &VirtioKvmEpollHandler) {
         let partitions = self.partitions.lock().unwrap();
-        for conn in partitions.values() {
-            Self::prepare_connection(conn, virtio_kvm);
+        for partition in partitions.values() {
+            Self::prepare_connection(partition.client(), virtio_kvm);
         }
     }
 
@@ -568,28 +611,30 @@ impl TachyonConnection {
         &self,
         virtio_kvm: &VirtioKvmEpollHandler,
         partition_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<TachyonPartition> {
         let mut partitions = self.partitions.lock().unwrap();
-        if let Some(conn) = partitions.get(&partition_id) {
-            Self::prepare_connection(conn, virtio_kvm);
-            return Ok(());
+        if let Some(partition) = partitions.get(&partition_id) {
+            Self::prepare_connection(partition.client(), virtio_kvm);
+            return Ok(partition.clone());
         }
         let sock_path = self.socket_for_partition(partition_id);
         let new_conn = Arc::new(Self::connect(&sock_path)?);
         Self::prepare_connection(&new_conn, virtio_kvm);
-        partitions.insert(partition_id, new_conn);
-        Ok(())
+        let partition = TachyonPartition::new(partition_id, new_conn);
+        partitions.insert(partition_id, partition.clone());
+        Ok(partition)
     }
 
-    pub fn get_for_partition(&self, partition_id: u64) -> io::Result<Arc<RpcClient>> {
+    pub fn get_partition(&self, partition_id: u64) -> io::Result<TachyonPartition> {
         let mut partitions = self.partitions.lock().unwrap();
-        if let Some(client) = partitions.get(&partition_id) {
-            return Ok(client.clone());
+        if let Some(partition) = partitions.get(&partition_id) {
+            return Ok(partition.clone());
         }
         let sock_path = self.socket_for_partition(partition_id);
         let client = Arc::new(Self::connect(&sock_path)?);
-        partitions.insert(partition_id, client.clone());
-        Ok(client)
+        let partition = TachyonPartition::new(partition_id, client);
+        partitions.insert(partition_id, partition.clone());
+        Ok(partition)
     }
 
     #[allow(dead_code)]
@@ -598,8 +643,8 @@ impl TachyonConnection {
     }
 
     pub fn call_partition(&self, partition_id: u64, msg: Message) -> io::Result<Message> {
-        let conn = self.get_for_partition(partition_id)?;
-        conn.call(msg)
+        let partition = self.get_partition(partition_id)?;
+        partition.call(msg)
     }
 
     #[allow(dead_code)]
@@ -608,22 +653,22 @@ impl TachyonConnection {
     }
 
     pub fn asynchronous_call_partition(&self, partition_id: u64, msg: Message) -> io::Result<()> {
-        let conn = self.get_for_partition(partition_id)?;
-        conn.asynchronous_call(msg)
+        let partition = self.get_partition(partition_id)?;
+        partition.asynchronous_call(msg)
     }
 
     pub fn fail_pending_requests(&self) {
         let partitions = self.partitions.lock().unwrap();
-        for conn in partitions.values() {
-            conn.fail_pending_requests();
+        for partition in partitions.values() {
+            partition.fail_pending_requests();
         }
     }
 
     pub fn pause_all(&self) {
         let partitions = self.partitions.lock().unwrap();
-        for (partition_id, conn) in partitions.iter() {
+        for (partition_id, partition) in partitions.iter() {
             let msg = Message::simple(TachyonOp::Pause as u32, 1);
-            if let Err(e) = conn.call(msg) {
+            if let Err(e) = partition.call(msg) {
                 error!(
                     "virtio-kvm: Failed to send Pause RPC to Tachyon partition {partition_id}: {e}"
                 );
@@ -633,9 +678,9 @@ impl TachyonConnection {
 
     pub fn unpause_all(&self) {
         let partitions = self.partitions.lock().unwrap();
-        for (partition_id, conn) in partitions.iter() {
+        for (partition_id, partition) in partitions.iter() {
             let msg = Message::simple(TachyonOp::Unpause as u32, 1);
-            if let Err(e) = conn.call(msg) {
+            if let Err(e) = partition.call(msg) {
                 error!(
                     "virtio-kvm: Failed to send Unpause RPC to Tachyon partition {partition_id}: {e}"
                 );
@@ -686,13 +731,16 @@ struct VirtioKvmEpollHandler {
 
 trait TachyonResource {
     fn tachyon_handle(&self) -> u64;
-    fn partition_id(&self) -> u64;
+    fn partition(&self) -> &TachyonPartition;
+    fn partition_id(&self) -> u64 {
+        self.partition().partition_id()
+    }
 }
 
 #[derive(Debug)]
 struct VirtioKvmSystem {
     kvm: kvm_ioctls::Kvm,
-    partition_id: u64,
+    partition: TachyonPartition,
 }
 
 impl AsRawFd for VirtioKvmSystem {
@@ -706,8 +754,8 @@ impl TachyonResource for VirtioKvmSystem {
         1
     }
 
-    fn partition_id(&self) -> u64 {
-        self.partition_id
+    fn partition(&self) -> &TachyonPartition {
+        &self.partition
     }
 }
 
@@ -716,7 +764,7 @@ struct VirtioKvmVm {
     shm_fd: RawFd,
     tachyon_handle: u64,
     shm_bar_offset: Arc<AtomicU64>,
-    partition_id: u64,
+    partition: TachyonPartition,
 }
 
 impl Drop for VirtioKvmVm {
@@ -739,15 +787,15 @@ impl TachyonResource for VirtioKvmVm {
         self.tachyon_handle
     }
 
-    fn partition_id(&self) -> u64 {
-        self.partition_id
+    fn partition(&self) -> &TachyonPartition {
+        &self.partition
     }
 }
 
 struct VirtioKvmVfioContainer {
     fd: RawFd,
     tachyon_handle: u64,
-    partition_id: u64,
+    partition: TachyonPartition,
 }
 
 impl Drop for VirtioKvmVfioContainer {
@@ -767,7 +815,7 @@ impl fmt::Debug for VirtioKvmVfioContainer {
         f.debug_struct("VirtioKvmVfioContainer")
             .field("fd", &self.fd)
             .field("tachyon_handle", &self.tachyon_handle)
-            .field("partition_id", &self.partition_id)
+            .field("partition_id", &self.partition.partition_id())
             .finish()
     }
 }
@@ -777,15 +825,15 @@ impl TachyonResource for VirtioKvmVfioContainer {
         self.tachyon_handle
     }
 
-    fn partition_id(&self) -> u64 {
-        self.partition_id
+    fn partition(&self) -> &TachyonPartition {
+        &self.partition
     }
 }
 
 struct VirtioKvmVfioGroup {
     fd: RawFd,
     tachyon_handle: u64,
-    partition_id: u64,
+    partition: TachyonPartition,
 }
 
 impl Drop for VirtioKvmVfioGroup {
@@ -805,7 +853,7 @@ impl fmt::Debug for VirtioKvmVfioGroup {
         f.debug_struct("VirtioKvmVfioGroup")
             .field("fd", &self.fd)
             .field("tachyon_handle", &self.tachyon_handle)
-            .field("partition_id", &self.partition_id)
+            .field("partition_id", &self.partition.partition_id())
             .finish()
     }
 }
@@ -815,15 +863,15 @@ impl TachyonResource for VirtioKvmVfioGroup {
         self.tachyon_handle
     }
 
-    fn partition_id(&self) -> u64 {
-        self.partition_id
+    fn partition(&self) -> &TachyonPartition {
+        &self.partition
     }
 }
 
 struct VirtioKvmVfioDevice {
     fd: RawFd,
     tachyon_handle: u64,
-    partition_id: u64,
+    partition: TachyonPartition,
 }
 
 impl Drop for VirtioKvmVfioDevice {
@@ -843,7 +891,7 @@ impl fmt::Debug for VirtioKvmVfioDevice {
         f.debug_struct("VirtioKvmVfioDevice")
             .field("fd", &self.fd)
             .field("tachyon_handle", &self.tachyon_handle)
-            .field("partition_id", &self.partition_id)
+            .field("partition_id", &self.partition.partition_id())
             .finish()
     }
 }
@@ -853,8 +901,8 @@ impl TachyonResource for VirtioKvmVfioDevice {
         self.tachyon_handle
     }
 
-    fn partition_id(&self) -> u64 {
-        self.partition_id
+    fn partition(&self) -> &TachyonPartition {
+        &self.partition
     }
 }
 
@@ -863,8 +911,7 @@ struct VirtioKvmVcpu {
     vcpu_id: u32,
     vm_handle: Handle,
     tachyon_handle: u64,
-    tachyon: TachyonConnection,
-    partition_id: u64,
+    partition: TachyonPartition,
 }
 
 impl Drop for VirtioKvmVcpu {
@@ -881,7 +928,7 @@ impl fmt::Debug for VirtioKvmVcpu {
                 "tachyon_handle",
                 &format_args!("0x{:x}", self.tachyon_handle),
             )
-            .field("partition_id", &self.partition_id)
+            .field("partition_id", &self.partition.partition_id())
             .finish()
     }
 }
@@ -897,8 +944,8 @@ impl TachyonResource for VirtioKvmVcpu {
         self.tachyon_handle
     }
 
-    fn partition_id(&self) -> u64 {
-        self.partition_id
+    fn partition(&self) -> &TachyonPartition {
+        &self.partition
     }
 }
 
@@ -912,7 +959,7 @@ impl fmt::Debug for VirtioKvmVm {
                 &format_args!("0x{:x}", self.tachyon_handle),
             )
             .field("shm_bar_offset", &self.shm_bar_offset)
-            .field("partition_id", &self.partition_id)
+            .field("partition_id", &self.partition.partition_id())
             .finish()
     }
 }
@@ -920,7 +967,7 @@ impl fmt::Debug for VirtioKvmVm {
 struct VirtioKvmStats {
     fd: RawFd,
     parent_handle: Handle,
-    partition_id: u64,
+    partition: TachyonPartition,
 }
 
 impl AsRawFd for VirtioKvmStats {
@@ -933,7 +980,7 @@ impl fmt::Debug for VirtioKvmStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VirtioKvmStats")
             .field("fd", &self.fd)
-            .field("partition_id", &self.partition_id)
+            .field("partition_id", &self.partition.partition_id())
             .finish()
     }
 }
@@ -949,8 +996,8 @@ impl TachyonResource for VirtioKvmStats {
         0
     }
 
-    fn partition_id(&self) -> u64 {
-        self.partition_id
+    fn partition(&self) -> &TachyonPartition {
+        &self.partition
     }
 }
 
@@ -979,35 +1026,38 @@ impl AsRawFd for VirtioKvmResource {
     }
 }
 
+impl TachyonResource for VirtioKvmResource {
+    fn tachyon_handle(&self) -> u64 {
+        match self {
+            VirtioKvmResource::System(sys) => sys.tachyon_handle(),
+            VirtioKvmResource::Vm(vm) => vm.tachyon_handle(),
+            VirtioKvmResource::Vcpu(vcpu) => vcpu.tachyon_handle(),
+            VirtioKvmResource::Stats(stats) => stats.tachyon_handle(),
+            VirtioKvmResource::VfioContainer(container) => container.tachyon_handle(),
+            VirtioKvmResource::VfioGroup(group) => group.tachyon_handle(),
+            VirtioKvmResource::VfioDevice(device) => device.tachyon_handle(),
+        }
+    }
+
+    fn partition(&self) -> &TachyonPartition {
+        match self {
+            VirtioKvmResource::System(sys) => &sys.partition,
+            VirtioKvmResource::Vm(vm) => &vm.partition,
+            VirtioKvmResource::Vcpu(vcpu) => &vcpu.partition,
+            VirtioKvmResource::Stats(stats) => &stats.partition,
+            VirtioKvmResource::VfioContainer(container) => &container.partition,
+            VirtioKvmResource::VfioGroup(group) => &group.partition,
+            VirtioKvmResource::VfioDevice(device) => &device.partition,
+        }
+    }
+}
+
 impl VirtioKvmResource {
-    fn tachyon_handle(&self) -> Option<u64> {
-        match self {
-            VirtioKvmResource::Vm(vm) => Some(vm.tachyon_handle),
-            VirtioKvmResource::Vcpu(vcpu) => Some(vcpu.tachyon_handle),
-            VirtioKvmResource::VfioContainer(container) => Some(container.tachyon_handle),
-            VirtioKvmResource::VfioGroup(group) => Some(group.tachyon_handle),
-            VirtioKvmResource::VfioDevice(device) => Some(device.tachyon_handle),
-            _ => None,
-        }
-    }
-
-    fn partition_id(&self) -> u64 {
-        match self {
-            VirtioKvmResource::System(sys) => sys.partition_id,
-            VirtioKvmResource::Vm(vm) => vm.partition_id,
-            VirtioKvmResource::Vcpu(vcpu) => vcpu.partition_id,
-            VirtioKvmResource::Stats(stats) => stats.partition_id,
-            VirtioKvmResource::VfioContainer(container) => container.partition_id,
-            VirtioKvmResource::VfioGroup(group) => group.partition_id,
-            VirtioKvmResource::VfioDevice(device) => device.partition_id,
-        }
-    }
-
-    fn new_system(partition_id: u64) -> Result<Self, ErrnoError> {
+    fn new_system(partition: TachyonPartition) -> Result<Self, ErrnoError> {
         match kvm_ioctls::Kvm::new() {
             Ok(kvm) => Ok(VirtioKvmResource::System(VirtioKvmSystem {
                 kvm,
-                partition_id,
+                partition,
             })),
             Err(e) => Err(e),
         }
@@ -1049,7 +1099,7 @@ impl VirtioKvmEpollHandler {
 
     fn handle_set_msr_filter(
         &self,
-        partition_id: u64,
+        partition: &TachyonPartition,
         tachyon_handle: u64,
         req: &VirtioKvmReq,
         mem: &GuestMemoryMmap,
@@ -1098,7 +1148,7 @@ impl VirtioKvmEpollHandler {
 
         let msg = Message::ioctl(tachyon_handle, req.arg, 0).with_body(body);
 
-        match self.tachyon.call_partition(partition_id, msg) {
+        match partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::from_data(resp.arg)
@@ -1116,11 +1166,16 @@ impl VirtioKvmEpollHandler {
     fn handle_open(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
         let partition_id = req.arg;
         debug!("!! virtio_kvm: handle_open for partition {partition_id}");
-        if let Err(e) = self.tachyon.prepare_partition(self, partition_id) {
-            debug!("!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}");
-            return VirtioKvmResp::from_errno(libc::EIO);
-        }
-        let vm = match VirtioKvmResource::new_system(partition_id) {
+        let partition = match self.tachyon.prepare_partition(self, partition_id) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(
+                    "!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}"
+                );
+                return VirtioKvmResp::from_errno(libc::EIO);
+            }
+        };
+        let vm = match VirtioKvmResource::new_system(partition) {
             Ok(vm) => vm,
             Err(e) => {
                 return VirtioKvmResp::from_errno(e.errno());
@@ -1154,16 +1209,14 @@ impl VirtioKvmEpollHandler {
             }
         };
 
-        let (tachyon_handle, partition_id) = {
+        let (tachyon_handle, partition) = {
             let guard = resource.lock().unwrap();
-            (guard.tachyon_handle(), guard.partition_id())
+            (guard.tachyon_handle(), guard.partition().clone())
         };
 
-        if let Some(th) = tachyon_handle {
-            let msg = Message::new(TachyonOp::Close as u32, th, 0, 0);
-            if let Err(e) = self.tachyon.call_partition(partition_id, msg) {
-                error!("virtio-kvm: close() RPC failed: {e}");
-            }
+        let msg = Message::new(TachyonOp::Close as u32, tachyon_handle, 0, 0);
+        if let Err(e) = partition.call(msg) {
+            error!("virtio-kvm: close() RPC failed: {e}");
         }
 
         VirtioKvmResp::success()
@@ -1196,10 +1249,7 @@ impl VirtioKvmEpollHandler {
                     body: Vec::new(),
                     fds: None,
                 };
-                if let Err(e) = virtio_vcpu
-                    .tachyon
-                    .asynchronous_call_partition(virtio_vcpu.partition_id, msg)
-                {
+                if let Err(e) = virtio_vcpu.partition.asynchronous_call(msg) {
                     error!("!! virtio_kvm: failed to send Interrupt RPC: {e}");
                 }
                 Some(VirtioKvmResp::success())
@@ -1208,12 +1258,12 @@ impl VirtioKvmEpollHandler {
         }
     }
 
-    fn handle_system_create_vm(&self, partition_id: u64) -> VirtioKvmResp {
+    fn handle_system_create_vm(&self, partition: &TachyonPartition) -> VirtioKvmResp {
         // 1. Request VM from Tachyon
         let handle: u64 = 1; // KVM Device handle in Tachyon is always 1
         let msg = Message::ioctl(handle, kvm::KVM_CREATE_VM, 0);
 
-        let resp = match self.tachyon.call_partition(partition_id, msg) {
+        let resp = match partition.call(msg) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: KVM_CREATE_VM RPC failed: {e}");
@@ -1240,7 +1290,7 @@ impl VirtioKvmEpollHandler {
         // 2. Get VM FD from Tachyon
         let msg_fd = Message::get_file(tachyon_vm_handle);
 
-        let resp_fd = match self.tachyon.call_partition(partition_id, msg_fd) {
+        let resp_fd = match partition.call(msg_fd) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: GetFileDescriptor RPC failed: {e}");
@@ -1271,7 +1321,7 @@ impl VirtioKvmEpollHandler {
             shm_fd,
             tachyon_handle: tachyon_vm_handle,
             shm_bar_offset: Arc::new(AtomicU64::new(u64::MAX)),
-            partition_id,
+            partition: partition.clone(),
         };
         self.resources
             .lock()
@@ -1281,11 +1331,15 @@ impl VirtioKvmEpollHandler {
         VirtioKvmResp::from_data(vm_handle.0)
     }
 
-    fn handle_system_generic_ioctl(&self, partition_id: u64, req: &VirtioKvmReq) -> VirtioKvmResp {
+    fn handle_system_generic_ioctl(
+        &self,
+        partition: &TachyonPartition,
+        req: &VirtioKvmReq,
+    ) -> VirtioKvmResp {
         let ioctl_num = req.arg;
         let msg = Message::ioctl(1, ioctl_num, req.longarg);
 
-        match self.tachyon.call_partition(partition_id, msg) {
+        match partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::from_data(resp.arg)
@@ -1302,14 +1356,19 @@ impl VirtioKvmEpollHandler {
 
     fn handle_open_vfio_container(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
         let partition_id = req.arg;
-        if let Err(e) = self.tachyon.prepare_partition(self, partition_id) {
-            debug!("!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}");
-            return VirtioKvmResp::from_errno(libc::EIO);
-        }
+        let partition = match self.tachyon.prepare_partition(self, partition_id) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(
+                    "!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}"
+                );
+                return VirtioKvmResp::from_errno(libc::EIO);
+            }
+        };
 
         // Make the VFIO container in Tachyon
         let msg = Message::simple(TachyonOp::OpenVfioContainer as u32, 1);
-        let resp = match self.tachyon.call_partition(partition_id, msg) {
+        let resp = match partition.call(msg) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: OpenVfioContainer RPC failed: {e}");
@@ -1326,7 +1385,7 @@ impl VirtioKvmEpollHandler {
         // Get the open file.
         let msg_fd = Message::get_file(tachyon_vfio_handle);
 
-        let resp_fd = match self.tachyon.call_partition(partition_id, msg_fd) {
+        let resp_fd = match partition.call(msg_fd) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: GetFileDescriptor RPC failed: {e}");
@@ -1351,7 +1410,7 @@ impl VirtioKvmEpollHandler {
         let vfio = VirtioKvmVfioContainer {
             fd: vfio_fd,
             tachyon_handle: tachyon_vfio_handle,
-            partition_id,
+            partition: partition.clone(),
         };
         self.resources.lock().unwrap().insert(
             vfio_handle,
@@ -1364,14 +1423,19 @@ impl VirtioKvmEpollHandler {
     fn handle_open_vfio_group(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
         let partition_id = req.arg;
         let group_id = req.longarg;
-        if let Err(e) = self.tachyon.prepare_partition(self, partition_id) {
-            debug!("!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}");
-            return VirtioKvmResp::from_errno(libc::EIO);
-        }
+        let partition = match self.tachyon.prepare_partition(self, partition_id) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(
+                    "!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}"
+                );
+                return VirtioKvmResp::from_errno(libc::EIO);
+            }
+        };
 
         let msg = Message::new(TachyonOp::OpenVfioGroup as u32, 1, 0, group_id);
 
-        let resp = match self.tachyon.call_partition(partition_id, msg) {
+        let resp = match partition.call(msg) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: OpenVfioGroup RPC failed: {e}");
@@ -1388,7 +1452,7 @@ impl VirtioKvmEpollHandler {
         // Get the open file.
         let msg_fd = Message::get_file(tachyon_group_handle);
 
-        let resp_fd = match self.tachyon.call_partition(partition_id, msg_fd) {
+        let resp_fd = match partition.call(msg_fd) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: GetFileDescriptor RPC failed: {e}");
@@ -1413,7 +1477,7 @@ impl VirtioKvmEpollHandler {
         let group = VirtioKvmVfioGroup {
             fd: group_fd,
             tachyon_handle: tachyon_group_handle,
-            partition_id,
+            partition: partition.clone(),
         };
         self.resources.lock().unwrap().insert(
             group_handle,
@@ -1426,13 +1490,18 @@ impl VirtioKvmEpollHandler {
     fn handle_vfio_get_groups(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
         let partition_id = req.arg;
         let buf_gpa = req.longarg;
-        if let Err(e) = self.tachyon.prepare_partition(self, partition_id) {
-            debug!("!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}");
-            return VirtioKvmResp::from_errno(libc::EIO);
-        }
+        let partition = match self.tachyon.prepare_partition(self, partition_id) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(
+                    "!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}"
+                );
+                return VirtioKvmResp::from_errno(libc::EIO);
+            }
+        };
 
         let msg = Message::simple(TachyonOp::VfioGetGroups as u32, 1);
-        let resp = match self.tachyon.call_partition(partition_id, msg) {
+        let resp = match partition.call(msg) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: VfioGetGroups RPC failed: {e}");
@@ -1457,7 +1526,7 @@ impl VirtioKvmEpollHandler {
 
     fn handle_msrs_ioctl(
         &self,
-        partition_id: u64,
+        partition: &TachyonPartition,
         handle: u64,
         req: &VirtioKvmReq,
         write_back: bool,
@@ -1481,7 +1550,7 @@ impl VirtioKvmEpollHandler {
         msg.resp_size = if write_back { full_size as u32 } else { 0 };
         msg.body = body;
 
-        match self.tachyon.call_partition(partition_id, msg) {
+        match partition.call(msg) {
             Ok(resp) => {
                 if write_back && !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -1501,7 +1570,7 @@ impl VirtioKvmEpollHandler {
 
     fn handle_enable_cap_ioctl(
         &self,
-        partition_id: u64,
+        partition: &TachyonPartition,
         handle: u64,
         req: &VirtioKvmReq,
     ) -> VirtioKvmResp {
@@ -1514,7 +1583,7 @@ impl VirtioKvmEpollHandler {
 
         let msg = Message::ioctl(handle, req.arg, 0).with_body(body);
 
-        match self.tachyon.call_partition(partition_id, msg) {
+        match partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::from_data(resp.arg)
@@ -1529,7 +1598,11 @@ impl VirtioKvmEpollHandler {
         }
     }
 
-    fn handle_msr_list_ioctl(&self, partition_id: u64, req: &VirtioKvmReq) -> VirtioKvmResp {
+    fn handle_msr_list_ioctl(
+        &self,
+        partition: &TachyonPartition,
+        req: &VirtioKvmReq,
+    ) -> VirtioKvmResp {
         let mem = self.mem.memory();
         let gpa = GuestAddress::new(req.longarg);
         let list: kvm::kvm_msr_list = match mem.read_obj(gpa) {
@@ -1548,7 +1621,7 @@ impl VirtioKvmEpollHandler {
             .with_body(body)
             .with_resp(full_size as u32);
 
-        match self.tachyon.call_partition(partition_id, msg) {
+        match partition.call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -1576,15 +1649,15 @@ impl VirtioKvmEpollHandler {
         let ioctl_num = req.arg;
         match ioctl_num {
             kvm::KVM_GET_API_VERSION | kvm::KVM_GET_VCPU_MMAP_SIZE | kvm::KVM_CHECK_EXTENSION => {
-                self.handle_system_generic_ioctl(system.partition_id, req)
+                self.handle_system_generic_ioctl(&system.partition, req)
             }
-            kvm::KVM_CREATE_VM => self.handle_system_create_vm(system.partition_id),
+            kvm::KVM_CREATE_VM => self.handle_system_create_vm(&system.partition),
             kvm::KVM_GET_SUPPORTED_CPUID | kvm::KVM_X86_GET_MCE_CAP_SUPPORTED => {
                 virtio_kvm_ioctl_with_uaccess(system.as_raw_fd(), req, &self.mem)
             }
-            kvm::KVM_GET_MSRS => self.handle_msrs_ioctl(system.partition_id, 1, req, true),
+            kvm::KVM_GET_MSRS => self.handle_msrs_ioctl(&system.partition, 1, req, true),
             kvm::KVM_GET_MSR_INDEX_LIST | kvm::KVM_GET_MSR_FEATURE_INDEX_LIST => {
-                self.handle_msr_list_ioctl(system.partition_id, req)
+                self.handle_msr_list_ioctl(&system.partition, req)
             }
             _ => {
                 debug!("!! virtio_kvm: handle_system_ioctl: unknown ioctl: {ioctl_num:#x}");
@@ -1736,7 +1809,7 @@ impl VirtioKvmEpollHandler {
             vfio::VFIO_GROUP_SET_CONTAINER,
             container.tachyon_handle,
         );
-        match self.tachyon.call_partition(group.partition_id, msg) {
+        match group.partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::from_data(resp.arg)
@@ -1764,7 +1837,7 @@ impl VirtioKvmEpollHandler {
         }
 
         let msg = Message::ioctl(group.tachyon_handle(), req.arg, 0).with_body(body);
-        let resp = match self.tachyon.call_partition(group.partition_id, msg) {
+        let resp = match group.partition.call(msg) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: VFIO_GROUP_GET_DEVICE_FD RPC failed: {e}");
@@ -1775,7 +1848,7 @@ impl VirtioKvmEpollHandler {
         let tachyon_device_handle = resp.handle;
 
         let msg_fd = Message::get_file(tachyon_device_handle);
-        let resp_fd = match self.tachyon.call_partition(group.partition_id, msg_fd) {
+        let resp_fd = match group.partition.call(msg_fd) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: GetFileDescriptor RPC failed: {e}");
@@ -1800,7 +1873,7 @@ impl VirtioKvmEpollHandler {
         let device = VirtioKvmVfioDevice {
             fd: device_fd,
             tachyon_handle: tachyon_device_handle,
-            partition_id: group.partition_id,
+            partition: group.partition.clone(),
         };
         self.resources.lock().unwrap().insert(
             device_handle,
@@ -1897,7 +1970,7 @@ impl VirtioKvmEpollHandler {
         let msg = Message::ioctl(device.tachyon_handle(), req.arg, 0)
             .with_body(args)
             .with_resp(sz as u32);
-        match self.tachyon.call_partition(device.partition_id, msg) {
+        match device.partition.call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -1975,8 +2048,8 @@ impl VirtioKvmEpollHandler {
                 if userspace_offset_in_bar >= mapping.phys_offset
                     && userspace_offset_in_bar + len <= mapping.phys_offset + mapping.size
                     && let Some(resource) = resources.get(handle)
-                    && let Some(tachyon_handle) = resource.lock().unwrap().tachyon_handle()
                 {
+                    let tachyon_handle = resource.lock().unwrap().tachyon_handle();
                     let offset_in_resource =
                         mapping.device_offset + (userspace_offset_in_bar - mapping.phys_offset);
                     return Ok((tachyon_handle, offset_in_resource, userspace_offset_in_bar));
@@ -2039,7 +2112,7 @@ impl VirtioKvmEpollHandler {
         let msg =
             Message::ioctl(vm.tachyon_handle, kvm::KVM_SET_USER_MEMORY_REGION2, 0).with_body(body);
 
-        match self.tachyon.call_partition(vm.partition_id, msg) {
+        match vm.partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::success()
@@ -2057,7 +2130,7 @@ impl VirtioKvmEpollHandler {
     fn handle_generic_ioctl<T: TachyonResource>(&self, t: &T, req: &VirtioKvmReq) -> VirtioKvmResp {
         let ioctl_num = req.arg;
         let msg = Message::ioctl(t.tachyon_handle(), ioctl_num, req.longarg);
-        match self.tachyon.call_partition(t.partition_id(), msg) {
+        match t.partition().call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::from_data(resp.arg)
@@ -2082,7 +2155,7 @@ impl VirtioKvmEpollHandler {
 
         // 1. Request VCPU from Tachyon
         let msg = Message::ioctl(vm.tachyon_handle, kvm::KVM_CREATE_VCPU, req.longarg);
-        let resp = match self.tachyon.call_partition(vm.partition_id, msg) {
+        let resp = match vm.partition.call(msg) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: KVM_CREATE_VCPU RPC failed: {e}");
@@ -2098,7 +2171,7 @@ impl VirtioKvmEpollHandler {
 
         // 2. Get VCPU FD from Tachyon
         let msg_fd = Message::get_file(tachyon_vcpu_handle);
-        let resp_fd = match self.tachyon.call_partition(vm.partition_id, msg_fd) {
+        let resp_fd = match vm.partition.call(msg_fd) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: GetFileDescriptor RPC failed: {e}");
@@ -2129,8 +2202,7 @@ impl VirtioKvmEpollHandler {
             vcpu_id: req.longarg as u32,
             vm_handle: req.handle,
             tachyon_handle: tachyon_vcpu_handle,
-            tachyon: self.tachyon.clone(),
-            partition_id: vm.partition_id,
+            partition: vm.partition.clone(),
         };
         self.resources.lock().unwrap().insert(
             vcpu_handle,
@@ -2167,7 +2239,7 @@ impl VirtioKvmEpollHandler {
         }
 
         let msg = Message::ioctl(vm.tachyon_handle, kvm::KVM_IOEVENTFD, 0).with_body(body);
-        match self.tachyon.call_partition(vm.partition_id, msg) {
+        match vm.partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::success()
@@ -2192,7 +2264,7 @@ impl VirtioKvmEpollHandler {
         let mem = self.mem.memory();
         let gpa = GuestAddress::new(req.longarg);
         let msg = Message::ioctl(vm.tachyon_handle, req.arg, 0).with_resp(size_of::<T>() as u32);
-        match self.tachyon.call_partition(vm.partition_id, msg) {
+        match vm.partition.call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -2225,7 +2297,7 @@ impl VirtioKvmEpollHandler {
         }
 
         let msg = Message::ioctl(resource.tachyon_handle(), req.arg, 0).with_body(body);
-        match self.tachyon.call_partition(resource.partition_id(), msg) {
+        match resource.partition().call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::success()
@@ -2266,7 +2338,7 @@ impl VirtioKvmEpollHandler {
         let msg = Message::ioctl(resource.tachyon_handle(), req.arg, 0)
             .with_body(body)
             .with_resp(size_of::<T>() as u32);
-        match self.tachyon.call_partition(resource.partition_id(), msg) {
+        match resource.partition().call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -2313,7 +2385,7 @@ impl VirtioKvmEpollHandler {
         let msg = Message::ioctl(resource.tachyon_handle(), req.arg, 0)
             .with_body(body)
             .with_resp(len as u32);
-        match self.tachyon.call_partition(resource.partition_id(), msg) {
+        match resource.partition().call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let write_len = resp.body.len().min(len);
@@ -2374,7 +2446,7 @@ impl VirtioKvmEpollHandler {
 
         let msg = Message::ioctl(vm.tachyon_handle, kvm::KVM_IRQFD, 0).with_body(body);
 
-        match self.tachyon.call_partition(vm.partition_id, msg) {
+        match vm.partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::success()
@@ -2406,7 +2478,7 @@ impl VirtioKvmEpollHandler {
 
         let msg = Message::ioctl(vm.tachyon_handle, kvm::KVM_SET_GSI_ROUTING, 0).with_body(body);
 
-        match self.tachyon.call_partition(vm.partition_id, msg) {
+        match vm.partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::success()
@@ -2434,10 +2506,10 @@ impl VirtioKvmEpollHandler {
                 self.handle_set_user_memory_region(vm, req)
             }
             kvm::KVM_ENABLE_CAP => {
-                self.handle_enable_cap_ioctl(vm.partition_id, vm.tachyon_handle, req)
+                self.handle_enable_cap_ioctl(&vm.partition, vm.tachyon_handle, req)
             }
             kvm::KVM_X86_SET_MSR_FILTER => self.handle_set_msr_filter(
-                vm.partition_id,
+                &vm.partition,
                 vm.tachyon_handle,
                 req,
                 &self.mem.memory(),
@@ -2446,7 +2518,7 @@ impl VirtioKvmEpollHandler {
             kvm::KVM_IOEVENTFD => self.handle_vm_ioeventfd(vm, req),
 
             kvm::KVM_GET_STATS_FD => {
-                self.handle_get_stats_fd(req.handle, vm.tachyon_handle, vm.partition_id)
+                self.handle_get_stats_fd(req.handle, vm.tachyon_handle, &vm.partition)
             }
 
             kvm::KVM_IRQFD => self.handle_vm_irqfd(vm, req),
@@ -2548,7 +2620,7 @@ impl VirtioKvmEpollHandler {
         let gpa = GuestAddress::new(req.longarg);
         let msg = Message::ioctl(vcpu.tachyon_handle, req.arg, 0).with_resp(size_of::<T>() as u32);
 
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -2582,7 +2654,7 @@ impl VirtioKvmEpollHandler {
 
         let msg = Message::ioctl(vcpu.tachyon_handle, req.arg, 0).with_body(body);
 
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::success()
@@ -2615,7 +2687,7 @@ impl VirtioKvmEpollHandler {
             .with_body(body)
             .with_resp(size_of::<T>() as u32);
 
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -2636,7 +2708,7 @@ impl VirtioKvmEpollHandler {
     fn handle_vcpu_generic_ioctl(&self, vcpu: &VirtioKvmVcpu, req: &VirtioKvmReq) -> VirtioKvmResp {
         let ioctl_num = req.arg;
         let msg = Message::ioctl(vcpu.tachyon_handle, ioctl_num, req.longarg);
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::from_data(resp.arg)
@@ -2671,7 +2743,7 @@ impl VirtioKvmEpollHandler {
 
         let msg = Message::ioctl(vcpu.tachyon_handle, kvm::KVM_SET_CPUID2, 0).with_body(body);
 
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::success()
@@ -2710,7 +2782,7 @@ impl VirtioKvmEpollHandler {
             .with_body(body)
             .with_resp(resp_size as u32);
 
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -2735,7 +2807,7 @@ impl VirtioKvmEpollHandler {
 
         // 1. Get the size for XSAVE area from Tachyon
         let msg_size = Message::ioctl(1, kvm::KVM_CHECK_EXTENSION, kvm::KVM_CAP_XSAVE2 as u64);
-        let xsave_size = match self.tachyon.call_partition(vcpu.partition_id, msg_size) {
+        let xsave_size = match vcpu.partition.call(msg_size) {
             Ok(resp) => {
                 if resp.status == 0 && resp.arg > 0 {
                     resp.arg as u32
@@ -2749,7 +2821,7 @@ impl VirtioKvmEpollHandler {
         // 2. Request XSAVE data
         let msg = Message::ioctl(vcpu.tachyon_handle, kvm::KVM_GET_XSAVE2, 0).with_resp(xsave_size);
 
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -2790,7 +2862,7 @@ impl VirtioKvmEpollHandler {
             .with_body(body)
             .with_resp(full_size as u32);
 
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -2829,7 +2901,7 @@ impl VirtioKvmEpollHandler {
 
         let msg = Message::ioctl(vcpu.tachyon_handle, kvm::KVM_SET_NESTED_STATE, 0).with_body(body);
 
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::success()
@@ -2850,7 +2922,7 @@ impl VirtioKvmEpollHandler {
         let gpa = GuestAddress::new(req.longarg);
         let msg = Message::ioctl(vcpu.tachyon_handle, kvm::KVM_GET_XSAVE, 0).with_resp(4096);
 
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if !resp.body.is_empty() {
                     let _ = mem.write_slice(&resp.body, gpa);
@@ -2879,7 +2951,7 @@ impl VirtioKvmEpollHandler {
 
         let msg = Message::ioctl(vcpu.tachyon_handle, kvm::KVM_SET_XSAVE, 0).with_body(body);
 
-        match self.tachyon.call_partition(vcpu.partition_id, msg) {
+        match vcpu.partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     VirtioKvmResp::success()
@@ -2937,18 +3009,18 @@ impl VirtioKvmEpollHandler {
                 Some(self.handle_vcpu_get_ioctl::<kvm::kvm_mp_state>(vcpu, req, "KVM_GET_MP_STATE"))
             }
             kvm::KVM_GET_MSRS => {
-                Some(self.handle_msrs_ioctl(vcpu.partition_id, vcpu.tachyon_handle, req, true))
+                Some(self.handle_msrs_ioctl(&vcpu.partition, vcpu.tachyon_handle, req, true))
             }
             kvm::KVM_SET_MSRS => {
-                Some(self.handle_msrs_ioctl(vcpu.partition_id, vcpu.tachyon_handle, req, false))
+                Some(self.handle_msrs_ioctl(&vcpu.partition, vcpu.tachyon_handle, req, false))
             }
             kvm::KVM_ENABLE_CAP => {
-                Some(self.handle_enable_cap_ioctl(vcpu.partition_id, vcpu.tachyon_handle, req))
+                Some(self.handle_enable_cap_ioctl(&vcpu.partition, vcpu.tachyon_handle, req))
             }
             kvm::KVM_SMI => Some(self.handle_vcpu_generic_ioctl(vcpu, req)),
 
             kvm::KVM_GET_STATS_FD => {
-                Some(self.handle_get_stats_fd(req.handle, vcpu.tachyon_handle, vcpu.partition_id))
+                Some(self.handle_get_stats_fd(req.handle, vcpu.tachyon_handle, &vcpu.partition))
             }
 
             kvm::KVM_GET_VCPU_EVENTS => Some(self.handle_vcpu_get_ioctl::<kvm::kvm_vcpu_events>(
@@ -3194,14 +3266,19 @@ impl VirtioKvmEpollHandler {
             return VirtioKvmResp::from_data(ctx);
         }
 
-        if let Err(e) = self.tachyon.prepare_partition(self, partition_id) {
-            debug!("!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}");
-            return VirtioKvmResp::from_errno(libc::EIO);
-        }
+        let partition = match self.tachyon.prepare_partition(self, partition_id) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(
+                    "!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}"
+                );
+                return VirtioKvmResp::from_errno(libc::EIO);
+            }
+        };
 
         let msg = Message::simple(TachyonOp::EventfdGet as u32, 1);
 
-        match self.tachyon.call_partition(partition_id, msg) {
+        match partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     let tachyon_handle = resp.handle;
@@ -3227,7 +3304,7 @@ impl VirtioKvmEpollHandler {
                         eventfd,
                         refs: 1,
                         tachyon_handle,
-                        partition_id,
+                        partition: partition.clone(),
                     };
                     eventfds.insert(ctx, info);
                     debug!(
@@ -3268,7 +3345,7 @@ impl VirtioKvmEpollHandler {
                     );
 
                     let msg = Message::simple(TachyonOp::Close as u32, info.tachyon_handle);
-                    let _ = self.tachyon.call_partition(info.partition_id, msg);
+                    let _ = info.partition.call(msg);
                 }
                 VirtioKvmResp::success()
             }
@@ -3307,10 +3384,15 @@ impl VirtioKvmEpollHandler {
 
     fn handle_memory_file_create(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
         let partition_id = req.arg;
-        if let Err(e) = self.tachyon.prepare_partition(self, partition_id) {
-            debug!("!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}");
-            return VirtioKvmResp::from_errno(libc::EIO);
-        }
+        let partition = match self.tachyon.prepare_partition(self, partition_id) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(
+                    "!! virtio_kvm: failed to prepare tachyon for partition {partition_id}: {e}"
+                );
+                return VirtioKvmResp::from_errno(libc::EIO);
+            }
+        };
 
         let mem = self.mem.memory();
         let mut create_req: VirtioKvmMemoryFileCreate =
@@ -3332,7 +3414,7 @@ impl VirtioKvmEpollHandler {
         // 1. Request Memory File from Tachyon
         let msg = Message::new(TachyonOp::MemoryFileCreate as u32, 1, 0, create_req.size);
 
-        let resp = match self.tachyon.call_partition(partition_id, msg) {
+        let resp = match partition.call(msg) {
             Ok(r) => r,
             Err(e) => {
                 error!("virtio-kvm: MemoryFileCreate RPC failed: {e}");
@@ -3378,7 +3460,7 @@ impl VirtioKvmEpollHandler {
                 unsafe { libc::close(fd) };
 
                 let msg = Message::simple(TachyonOp::Close as u32, tachyon_mem_handle);
-                if let Err(e) = self.tachyon.call_partition(partition_id, msg) {
+                if let Err(e) = partition.call(msg) {
                     error!("virtio-kvm: MemoryFileCreate cleanup RPC failed: {e}");
                 }
 
@@ -3396,7 +3478,7 @@ impl VirtioKvmEpollHandler {
             size: create_req.size,
             phys_offset: create_req.phys_offset,
             tachyon_handle: tachyon_mem_handle,
-            partition_id,
+            partition: partition.clone(),
         };
         let handle = Handle::new().0;
         self.mem_files.lock().unwrap().insert(handle, file);
@@ -3466,7 +3548,7 @@ impl VirtioKvmEpollHandler {
 
             let msg = Message::simple(TachyonOp::Close as u32, file.tachyon_handle);
 
-            match self.tachyon.call_partition(file.partition_id, msg) {
+            match file.partition.call(msg) {
                 Ok(resp) => {
                     if resp.status == 0 {
                         VirtioKvmResp::success()
@@ -3488,11 +3570,11 @@ impl VirtioKvmEpollHandler {
         &self,
         parent_handle: Handle,
         parent_tachyon_handle: u64,
-        partition_id: u64,
+        partition: &TachyonPartition,
     ) -> VirtioKvmResp {
         let msg = Message::ioctl(parent_tachyon_handle, kvm::KVM_GET_STATS_FD, 0);
 
-        match self.tachyon.call_partition(partition_id, msg) {
+        match partition.call(msg) {
             Ok(resp) => {
                 if resp.status == 0 {
                     let fd = resp.fds.and_then(|mut fds| fds.pop()).unwrap_or(-1);
@@ -3503,7 +3585,7 @@ impl VirtioKvmEpollHandler {
                     let stats = VirtioKvmStats {
                         fd,
                         parent_handle,
-                        partition_id,
+                        partition: partition.clone(),
                     };
                     let handle = Handle::new();
                     self.resources.lock().unwrap().insert(
@@ -3636,13 +3718,15 @@ impl VirtioKvmEpollHandler {
 
     fn handle_ready(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
         let handle: Handle = req.handle;
-        let (tachyon_handle, partition_id) = {
+        let (tachyon_handle, partition) = {
             let resource_map = self.resources.lock().unwrap();
             match resource_map.get(&handle) {
                 Some(resource) => {
                     let guard = resource.lock().unwrap();
                     match guard.deref() {
-                        VirtioKvmResource::Vcpu(vcpu) => (vcpu.tachyon_handle, vcpu.partition_id),
+                        VirtioKvmResource::Vcpu(vcpu) => {
+                            (vcpu.tachyon_handle, vcpu.partition.clone())
+                        }
                         _ => return VirtioKvmResp::from_errno(libc::EINVAL),
                     }
                 }
@@ -3662,7 +3746,7 @@ impl VirtioKvmEpollHandler {
             fds: None,
         };
 
-        if let Err(e) = self.tachyon.asynchronous_call_partition(partition_id, msg) {
+        if let Err(e) = partition.asynchronous_call(msg) {
             error!("!! virtio_kvm: Ready RPC failed: {e}");
             return VirtioKvmResp::from_errno(libc::EIO);
         }
@@ -3679,15 +3763,17 @@ impl VirtioKvmEpollHandler {
         };
 
         for resource in resources_clone {
-            let (tachyon_handle, partition_id, old_fd) = {
+            let (tachyon_handle, partition, old_fd) = {
                 let mut guard = resource.lock().unwrap();
                 match guard.deref_mut() {
-                    VirtioKvmResource::Vm(vm) => {
-                        (vm.tachyon_handle, vm.partition_id, &mut vm.fd as *mut RawFd)
-                    }
+                    VirtioKvmResource::Vm(vm) => (
+                        vm.tachyon_handle,
+                        vm.partition.clone(),
+                        &mut vm.fd as *mut RawFd,
+                    ),
                     VirtioKvmResource::Vcpu(vcpu) => (
                         vcpu.tachyon_handle,
-                        vcpu.partition_id,
+                        vcpu.partition.clone(),
                         &mut vcpu.fd as *mut RawFd,
                     ),
                     _ => continue,
@@ -3706,7 +3792,7 @@ impl VirtioKvmEpollHandler {
                 fds: None,
             };
 
-            match self.tachyon.call_partition(partition_id, msg) {
+            match partition.call(msg) {
                 Ok(resp) => {
                     if let Some(mut fds) = resp.fds
                         && let Some(new_fd) = fds.pop()
@@ -3742,12 +3828,9 @@ impl VirtioKvmEpollHandler {
                 continue;
             };
 
-            let (tachyon_handle, partition_id) = {
+            let (tachyon_handle, partition) = {
                 let guard = resource.lock().unwrap();
-                match guard.tachyon_handle() {
-                    Some(h) => (h, guard.partition_id()),
-                    None => continue,
-                }
+                (guard.tachyon_handle(), guard.partition().clone())
             };
 
             let msg = Message {
@@ -3762,7 +3845,7 @@ impl VirtioKvmEpollHandler {
                 fds: None,
             };
 
-            let resp = match self.tachyon.call_partition(partition_id, msg) {
+            let resp = match partition.call(msg) {
                 Ok(r) => r,
                 Err(e) => {
                     error!(
@@ -4071,6 +4154,7 @@ impl VirtioKvm {
 
             // 1. Reconstruct Memory Files
             for file_state in &state.mem_files {
+                let partition = tachyon.get_partition(file_state.partition_id)?;
                 let msg = Message {
                     msg_type: TachyonOp::GetFileDescriptor as u32,
                     request_id: 0,
@@ -4082,11 +4166,9 @@ impl VirtioKvm {
                     body: Vec::new(),
                     fds: None,
                 };
-                let resp = tachyon
-                    .call_partition(file_state.partition_id, msg)
-                    .map_err(|e| {
-                        io::Error::other(format!("Failed to get FD for memory file: {e}"))
-                    })?;
+                let resp = partition.call(msg).map_err(|e| {
+                    io::Error::other(format!("Failed to get FD for memory file: {e}"))
+                })?;
                 if resp.status != 0 {
                     return Err(io::Error::other(format!(
                         "Failed to get FD for memory file status={}",
@@ -4124,7 +4206,7 @@ impl VirtioKvm {
                     size: file_state.size,
                     phys_offset: file_state.phys_offset,
                     tachyon_handle: file_state.tachyon_handle,
-                    partition_id: file_state.partition_id,
+                    partition,
                 };
                 mem_files.lock().unwrap().insert(file_state.handle, file);
             }
@@ -4150,7 +4232,8 @@ impl VirtioKvm {
                     VirtioKvmResourceTypeState::System { partition_id } => *partition_id,
                     _ => 0,
                 };
-                let system_res = VirtioKvmResource::new_system(partition_id).map_err(|e| {
+                let partition = tachyon.get_partition(partition_id)?;
+                let system_res = VirtioKvmResource::new_system(partition).map_err(|e| {
                     io::Error::other(format!("Failed to create KVM system resource: {e}"))
                 })?;
                 resources
@@ -4167,6 +4250,7 @@ impl VirtioKvm {
                     partition_id,
                 } = &res_state.resource_type
                 {
+                    let partition = tachyon.get_partition(*partition_id)?;
                     let msg = Message {
                         msg_type: TachyonOp::GetFileDescriptor as u32,
                         request_id: 0,
@@ -4178,8 +4262,8 @@ impl VirtioKvm {
                         body: Vec::new(),
                         fds: None,
                     };
-                    let resp = tachyon
-                        .call_partition(*partition_id, msg)
+                    let resp = partition
+                        .call(msg)
                         .map_err(|e| io::Error::other(format!("Failed to get FDs for VM: {e}")))?;
                     if resp.status != 0 {
                         return Err(io::Error::other(format!(
@@ -4204,7 +4288,7 @@ impl VirtioKvm {
                         shm_fd,
                         tachyon_handle: *tachyon_handle,
                         shm_bar_offset: Arc::new(AtomicU64::new(*shm_bar_offset)),
-                        partition_id: *partition_id,
+                        partition,
                     };
                     resources.lock().unwrap().insert(
                         Handle(res_state.handle),
@@ -4222,6 +4306,7 @@ impl VirtioKvm {
                     partition_id,
                 } = &res_state.resource_type
                 {
+                    let partition = tachyon.get_partition(*partition_id)?;
                     let msg = Message {
                         msg_type: TachyonOp::GetFileDescriptor as u32,
                         request_id: 0,
@@ -4233,8 +4318,8 @@ impl VirtioKvm {
                         body: Vec::new(),
                         fds: None,
                     };
-                    let resp = tachyon
-                        .call_partition(*partition_id, msg)
+                    let resp = partition
+                        .call(msg)
                         .map_err(|e| io::Error::other(format!("Failed to get FD for VCPU: {e}")))?;
                     if resp.status != 0 {
                         return Err(io::Error::other(format!(
@@ -4252,8 +4337,7 @@ impl VirtioKvm {
                         vcpu_id: *vcpu_id,
                         vm_handle: Handle(*vm_handle),
                         tachyon_handle: *tachyon_handle,
-                        tachyon: tachyon.clone(),
-                        partition_id: *partition_id,
+                        partition,
                     };
                     resources.lock().unwrap().insert(
                         Handle(res_state.handle),
@@ -4291,6 +4375,7 @@ impl VirtioKvm {
                         }
                     };
 
+                    let partition = tachyon.get_partition(*partition_id)?;
                     let msg = Message {
                         msg_type: TachyonOp::Ioctl as u32,
                         request_id: 0,
@@ -4302,7 +4387,7 @@ impl VirtioKvm {
                         body: Vec::new(),
                         fds: None,
                     };
-                    let resp = tachyon.call_partition(*partition_id, msg).map_err(|e| {
+                    let resp = partition.call(msg).map_err(|e| {
                         io::Error::other(format!("Failed to get stats FD from Tachyon: {e}"))
                     })?;
                     if resp.status != 0 {
@@ -4319,7 +4404,7 @@ impl VirtioKvm {
                     let stats = VirtioKvmStats {
                         fd: stats_fd,
                         parent_handle: Handle(*parent_handle),
-                        partition_id: *partition_id,
+                        partition,
                     };
                     resources.lock().unwrap().insert(
                         Handle(res_state.handle),
@@ -4330,9 +4415,10 @@ impl VirtioKvm {
 
             // 3. Reconstruct Eventfds
             for ev_state in &state.eventfds {
+                let partition = tachyon.get_partition(ev_state.partition_id)?;
                 let msg = Message::get_file(ev_state.tachyon_handle);
-                let resp = tachyon
-                    .call_partition(ev_state.partition_id, msg)
+                let resp = partition
+                    .call(msg)
                     .map_err(|e| io::Error::other(format!("Failed to get FD for eventfd: {e}")))?;
                 if resp.status != 0 {
                     return Err(io::Error::other(format!(
@@ -4350,7 +4436,7 @@ impl VirtioKvm {
                     eventfd,
                     refs: ev_state.refs,
                     tachyon_handle: ev_state.tachyon_handle,
-                    partition_id: ev_state.partition_id,
+                    partition,
                 };
                 eventfds.lock().unwrap().insert(ev_state.ctx, info);
             }
@@ -4441,22 +4527,22 @@ impl VirtioKvm {
             let resource_guard = resource_lock.lock().unwrap();
             let resource_type = match resource_guard.deref() {
                 VirtioKvmResource::System(sys) => VirtioKvmResourceTypeState::System {
-                    partition_id: sys.partition_id,
+                    partition_id: sys.partition_id(),
                 },
                 VirtioKvmResource::Vm(vm) => VirtioKvmResourceTypeState::Vm {
                     tachyon_handle: vm.tachyon_handle,
                     shm_bar_offset: vm.shm_bar_offset.load(Ordering::Acquire),
-                    partition_id: vm.partition_id,
+                    partition_id: vm.partition_id(),
                 },
                 VirtioKvmResource::Vcpu(vcpu) => VirtioKvmResourceTypeState::Vcpu {
                     vcpu_id: vcpu.vcpu_id,
                     vm_handle: vcpu.vm_handle.0,
                     tachyon_handle: vcpu.tachyon_handle,
-                    partition_id: vcpu.partition_id,
+                    partition_id: vcpu.partition_id(),
                 },
                 VirtioKvmResource::Stats(stats) => VirtioKvmResourceTypeState::Stats {
                     parent_handle: stats.parent_handle.0,
-                    partition_id: stats.partition_id,
+                    partition_id: stats.partition_id(),
                 },
                 VirtioKvmResource::VfioContainer(_)
                 | VirtioKvmResource::VfioGroup(_)
@@ -4475,7 +4561,7 @@ impl VirtioKvm {
                 ctx: *ctx,
                 refs: info.refs,
                 tachyon_handle: info.tachyon_handle,
-                partition_id: info.partition_id,
+                partition_id: info.partition.partition_id(),
             });
         }
 
@@ -4487,7 +4573,7 @@ impl VirtioKvm {
                 size: file.size,
                 phys_offset: file.phys_offset,
                 tachyon_handle: file.tachyon_handle,
-                partition_id: file.partition_id,
+                partition_id: file.partition.partition_id(),
             });
         }
 
