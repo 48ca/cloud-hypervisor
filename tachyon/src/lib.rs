@@ -131,6 +131,9 @@ pub const STATE_COMPLETED: u32 = 0x2;
 pub const STATE_MASK: u32 = 0xf;
 
 pub const FLAG_HOST_POLLING: u32 = 0x10;
+/// Set by the guest while it busy-polls for STATE_COMPLETED itself, in
+/// which case no run-completion notification is needed.
+pub const FLAG_GUEST_POLLING: u32 = 0x20;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
@@ -326,8 +329,9 @@ impl VcpuWorker {
                 &mut paused,
             ) {
                 Ok(true) => {
-                    Self::execute_kvm_run(vcpu_fd, shm_entry, &sigset);
-                    shm.notify_run_completed();
+                    if !Self::execute_kvm_run(vcpu_fd, shm_entry, &sigset) {
+                        shm.notify_run_completed();
+                    }
                     continue;
                 }
                 Ok(false) => (),
@@ -446,8 +450,13 @@ impl VcpuWorker {
     }
 
     /// Executes the KVM_RUN ioctl and updates the shared memory state
-    /// with the result.
-    fn execute_kvm_run(vcpu_fd: RawFd, shm_entry: &mut PerVcpuState, sigset: &libc::sigset_t) {
+    /// with the result. Returns whether the guest was polling for the
+    /// completion at the moment it was published.
+    fn execute_kvm_run(
+        vcpu_fd: RawFd,
+        shm_entry: &mut PerVcpuState,
+        sigset: &libc::sigset_t,
+    ) -> bool {
         trace!("VcpuWorker: KVM_RUN (polling) on fd={}", vcpu_fd);
         let ret = unsafe { libc::ioctl(vcpu_fd, kvm::KVM_RUN as _, 0) };
         let status = if ret < 0 {
@@ -472,13 +481,15 @@ impl VcpuWorker {
         let mut current = shm_entry.state.load(Ordering::Acquire);
         loop {
             let next = (current & !STATE_MASK) | STATE_COMPLETED;
+            // SeqCst so that the guest's clearing of FLAG_GUEST_POLLING and
+            // this publication are totally ordered (Dekker with the guest).
             match shm_entry.state.compare_exchange_weak(
                 current,
                 next,
-                Ordering::Release,
+                Ordering::SeqCst,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => break,
+                Ok(_) => return (current & FLAG_GUEST_POLLING) != 0,
                 Err(actual) => current = actual,
             }
         }
