@@ -153,6 +153,7 @@ pub enum Operation {
     OpenVfioContainer = 15,
     OpenVfioGroup = 16,
     VfioGetGroups = 17,
+    SetRunNotify = 18,
     Unknown = u32::MAX,
 }
 
@@ -198,6 +199,7 @@ impl From<u32> for Operation {
             15 => Operation::OpenVfioContainer,
             16 => Operation::OpenVfioGroup,
             17 => Operation::VfioGetGroups,
+            18 => Operation::SetRunNotify,
             _ => Operation::Unknown,
         }
     }
@@ -276,6 +278,7 @@ impl VcpuWorker {
         channel: Arc<rpc::Channel>,
         vcpu_fd: RawFd,
         shm_entry_ptr: ShmEntryPtr,
+        shm: Arc<VcpuSharedMemoryMapping>,
     ) {
         let shm_entry: &mut PerVcpuState = unsafe { &mut *shm_entry_ptr.0 };
         debug!("VcpuWorker thread starting for fd={}", vcpu_fd);
@@ -324,6 +327,7 @@ impl VcpuWorker {
             ) {
                 Ok(true) => {
                     Self::execute_kvm_run(vcpu_fd, shm_entry, &sigset);
+                    shm.notify_run_completed();
                     continue;
                 }
                 Ok(false) => (),
@@ -530,7 +534,12 @@ impl VcpuWorker {
         }
     }
 
-    fn new(vcpu_fd: RawFd, channel: Arc<rpc::Channel>, shm_entry: *mut PerVcpuState) -> Self {
+    fn new(
+        vcpu_fd: RawFd,
+        channel: Arc<rpc::Channel>,
+        shm_entry: *mut PerVcpuState,
+        shm: Arc<VcpuSharedMemoryMapping>,
+    ) -> Self {
         let (work_sender, work_receiver) = std::sync::mpsc::channel();
         let shm_entry_ptr = ShmEntryPtr(shm_entry);
 
@@ -547,7 +556,7 @@ impl VcpuWorker {
         let thread = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                Self::run(work_receiver, channel, vcpu_fd, shm_entry_ptr);
+                Self::run(work_receiver, channel, vcpu_fd, shm_entry_ptr, shm);
             })
             .expect("Failed to spawn VcpuWorker thread");
 
@@ -1099,6 +1108,8 @@ pub struct VcpuSharedMemoryMapping {
     fd: RawFd,
     addr: *mut VcpuSharedMemory,
     size: usize,
+    /// Eventfd signalled after a vCPU publishes STATE_COMPLETED, or -1.
+    run_notify_fd: std::sync::atomic::AtomicI32,
 }
 
 unsafe impl Send for VcpuSharedMemoryMapping {}
@@ -1143,17 +1154,41 @@ impl VcpuSharedMemoryMapping {
             fd,
             addr: addr as *mut VcpuSharedMemory,
             size,
+            run_notify_fd: std::sync::atomic::AtomicI32::new(-1),
         }
     }
 
     fn fd(&self) -> RawFd {
         self.fd
     }
+
+    /// Installs `fd` as the run-completion eventfd, taking ownership of it.
+    fn set_run_notify_fd(&self, fd: RawFd) {
+        let old = self.run_notify_fd.swap(fd, Ordering::AcqRel);
+        if old >= 0 {
+            // SAFETY: `old` was owned by this mapping and has just been
+            // swapped out, so nothing else closes or uses it.
+            unsafe { libc::close(old) };
+        }
+    }
+
+    /// Signals the run-completion eventfd, if one is installed.
+    fn notify_run_completed(&self) {
+        let fd = self.run_notify_fd.load(Ordering::Acquire);
+        if fd >= 0 {
+            let val: u64 = 1;
+            // SAFETY: Writes 8 bytes from a valid u64 to an eventfd owned by
+            // this mapping. A failure only loses a wakeup that the guest's
+            // own polling or a later completion will make up for.
+            unsafe { libc::write(fd, &val as *const u64 as *const libc::c_void, 8) };
+        }
+    }
 }
 
 impl Drop for VcpuSharedMemoryMapping {
     fn drop(&mut self) {
         debug!("Dropping VcpuSharedMemoryMapping, closing fd={}", self.fd);
+        self.set_run_notify_fd(-1);
         unsafe {
             libc::munmap(self.addr as *mut libc::c_void, self.size);
         }
@@ -2244,7 +2279,7 @@ impl VcpuOps {
         VcpuOps {
             vm_id,
             vcpu_id,
-            worker: Mutex::new(VcpuWorker::new(vcpu_fd, channel, shm_entry)),
+            worker: Mutex::new(VcpuWorker::new(vcpu_fd, channel, shm_entry, shm.clone())),
             _shm: shm,
         }
     }
@@ -2874,6 +2909,40 @@ impl HandleOps for VcpuOps {
     }
 }
 
+impl VmOps {
+    /// Binds the eventfd handle in `msg.arg` as this VM's run-completion
+    /// notifier, so that a guest without a polling thread is told when a
+    /// vCPU finishes KVM_RUN.
+    fn handle_set_run_notify(
+        &self,
+        handle: &Handle,
+        system: &Arc<System>,
+        msg: &Message,
+    ) -> Message {
+        let fd = match system.get_handle(msg.arg).and_then(|h| h.fd()) {
+            Some(fd) => fd,
+            None => {
+                error!(
+                    "[VmOps 0x{:x}] SetRunNotify: bad eventfd handle 0x{:x}",
+                    handle.id, msg.arg
+                );
+                return Message::reply(msg).with_error(libc::EBADF as u64);
+            }
+        };
+        // SAFETY: `fd` belongs to a live eventfd handle; duplicating it has
+        // no memory-safety requirements.
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            return Message::reply(msg).with_error(err as u64);
+        }
+        self.shared_memory.set_run_notify_fd(dup);
+        Message::reply(msg)
+    }
+}
+
 impl HandleOps for VmOps {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -2908,6 +2977,7 @@ impl HandleOps for VmOps {
                 resp.fds = Some(vec![shm_fd, vm_fd]);
                 Some(resp)
             }
+            Operation::SetRunNotify => Some(self.handle_set_run_notify(handle, system, msg)),
             _ => Some(Message::reply(msg).with_error(libc::ENOSYS as u64)),
         }
     }
