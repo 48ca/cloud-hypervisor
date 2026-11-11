@@ -214,6 +214,7 @@ enum Operation {
     EventfdPoll,
     FileIO,
     Ready,
+    SetRunNotify,
     OpenVfioContainer,
     OpenVfioGroup,
     VfioGetGroups,
@@ -238,6 +239,7 @@ impl TryFrom<u64> for Operation {
             11 => Ok(Operation::EventfdPoll),
             12 => Ok(Operation::FileIO),
             13 => Ok(Operation::Ready),
+            14 => Ok(Operation::SetRunNotify),
             64 => Ok(Operation::OpenVfioContainer),
             65 => Ok(Operation::OpenVfioGroup),
             68 => Ok(Operation::VfioGetGroups),
@@ -3754,6 +3756,38 @@ impl VirtioKvmEpollHandler {
         VirtioKvmResp::success()
     }
 
+    /// Binds the guest eventfd `req.arg` (as registered with EventfdGet) as
+    /// the run-completion notifier of the VM `req.handle` in Tachyon.
+    fn handle_set_run_notify(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
+        let handle: Handle = req.handle;
+        let (tachyon_handle, partition) = {
+            let resource_map = self.resources.lock().unwrap();
+            match resource_map.get(&handle) {
+                Some(resource) => {
+                    let guard = resource.lock().unwrap();
+                    match guard.deref() {
+                        VirtioKvmResource::Vm(vm) => (vm.tachyon_handle(), vm.partition.clone()),
+                        _ => return VirtioKvmResp::from_errno(libc::EINVAL),
+                    }
+                }
+                None => return VirtioKvmResp::from_errno(libc::ENOENT),
+            }
+        };
+        let Some(eventfd_handle) = self.resolve_eventfd(req.arg) else {
+            return VirtioKvmResp::from_errno(libc::EBADF);
+        };
+        let mut msg = Message::simple(TachyonOp::SetRunNotify as u32, tachyon_handle);
+        msg.arg = eventfd_handle;
+        match partition.call(msg) {
+            Ok(resp) if resp.status == 0 => VirtioKvmResp::success(),
+            Ok(resp) => VirtioKvmResp::from_errno(resp.status as i32),
+            Err(e) => {
+                error!("virtio-kvm: SetRunNotify RPC failed: {e}");
+                VirtioKvmResp::from_errno(libc::EIO)
+            }
+        }
+    }
+
     fn refresh_resources(&self) {
         info!("virtio-kvm: Refreshing resources after live-update");
         // 1. Refresh VM and VCPU FDs
@@ -3931,6 +3965,7 @@ impl VirtioKvmEpollHandler {
             Operation::EventfdPoll => self.handle_eventfd_poll(head_index, resp_addr),
             Operation::FileIO => Some(self.handle_file_io(req)),
             Operation::Ready => Some(self.handle_ready(req)),
+            Operation::SetRunNotify => Some(self.handle_set_run_notify(req)),
             Operation::OpenVfioContainer => Some(self.handle_open_vfio_container(req)),
             Operation::OpenVfioGroup => Some(self.handle_open_vfio_group(req)),
             Operation::VfioGetGroups => Some(self.handle_vfio_get_groups(req)),
