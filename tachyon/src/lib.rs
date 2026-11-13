@@ -157,6 +157,11 @@ pub enum Operation {
     OpenVfioGroup = 16,
     VfioGetGroups = 17,
     SetRunNotify = 18,
+    SetL1Memory = 19,
+    SetL1Memslot = 20,
+    InvalidateL1Memslot = 21,
+    FaultL1Page = 22,
+    AckL1Fault = 23,
     Unknown = u32::MAX,
 }
 
@@ -203,6 +208,11 @@ impl From<u32> for Operation {
             16 => Operation::OpenVfioGroup,
             17 => Operation::VfioGetGroups,
             18 => Operation::SetRunNotify,
+            19 => Operation::SetL1Memory,
+            20 => Operation::SetL1Memslot,
+            21 => Operation::InvalidateL1Memslot,
+            22 => Operation::FaultL1Page,
+            23 => Operation::AckL1Fault,
             _ => Operation::Unknown,
         }
     }
@@ -1216,6 +1226,135 @@ impl Drop for VcpuSharedMemoryMapping {
     }
 }
 
+const TACHYON_MEM_IOC_MAGIC: u32 = 0xB0;
+
+#[repr(C)]
+struct TachyonMemL1Region {
+    l1_gpa: u64,
+    size: u64,
+    hva: u64,
+}
+
+#[repr(C)]
+struct TachyonMemSetL1Regions {
+    count: u32,
+    pad: u32,
+    regions_ptr: u64,
+}
+
+#[repr(C)]
+struct TachyonMemCreateSlot {
+    size: u64,
+    table_hva: u64,
+    table_size: u64,
+}
+
+#[repr(C)]
+struct TachyonMemInvalidate {
+    offset: u64,
+    size: u64,
+}
+
+#[repr(C)]
+struct TachyonMemCreateSlotEx {
+    size: u64,
+    table_hva: u64,
+    table_size: u64,
+    tag: u64,
+}
+
+#[repr(C)]
+struct TachyonMemFaultReq {
+    tag: u64,
+    offset: u64,
+    seq: u64,
+}
+
+vmm_sys_util::ioctl_iow_nr!(
+    TACHYON_MEM_SET_L1_REGIONS,
+    TACHYON_MEM_IOC_MAGIC,
+    0x01,
+    TachyonMemSetL1Regions
+);
+vmm_sys_util::ioctl_iow_nr!(
+    TACHYON_MEM_CREATE_SLOT,
+    TACHYON_MEM_IOC_MAGIC,
+    0x02,
+    TachyonMemCreateSlot
+);
+vmm_sys_util::ioctl_iow_nr!(
+    TACHYON_MEM_INVALIDATE,
+    TACHYON_MEM_IOC_MAGIC,
+    0x03,
+    TachyonMemInvalidate
+);
+vmm_sys_util::ioctl_iow_nr!(
+    TACHYON_MEM_CREATE_SLOT_EX,
+    TACHYON_MEM_IOC_MAGIC,
+    0x04,
+    TachyonMemCreateSlotEx
+);
+vmm_sys_util::ioctl_ior_nr!(
+    TACHYON_MEM_GET_FAULT,
+    TACHYON_MEM_IOC_MAGIC,
+    0x05,
+    TachyonMemFaultReq
+);
+vmm_sys_util::ioctl_iow_nr!(
+    TACHYON_MEM_ACK_FAULT,
+    TACHYON_MEM_IOC_MAGIC,
+    0x06,
+    TachyonMemFaultReq
+);
+
+struct L1MemoryMapping {
+    addr: *mut libc::c_void,
+    size: usize,
+}
+
+// SAFETY: The mmaped region is owned by System and unmapped only on Drop.
+unsafe impl Send for L1MemoryMapping {}
+unsafe impl Sync for L1MemoryMapping {}
+
+impl Drop for L1MemoryMapping {
+    fn drop(&mut self) {
+        if !self.addr.is_null() && self.size > 0 {
+            // SAFETY: `self.addr` was returned by `libc::mmap` with `self.size`.
+            unsafe { libc::munmap(self.addr, self.size) };
+        }
+    }
+}
+
+struct L1MemSlot {
+    slot_fd: RawFd,
+    slot_hva: *mut libc::c_void,
+    memory_size: usize,
+    table_hva: *mut libc::c_void,
+    table_size: usize,
+    tag: u64,
+}
+
+// SAFETY: Slot mappings and fd are owned exclusively by `L1MemSlot`.
+unsafe impl Send for L1MemSlot {}
+unsafe impl Sync for L1MemSlot {}
+
+impl Drop for L1MemSlot {
+    fn drop(&mut self) {
+        if !self.slot_hva.is_null() && self.memory_size > 0 {
+            // SAFETY: `slot_hva` was returned by `libc::mmap` with `memory_size`.
+            unsafe { libc::munmap(self.slot_hva, self.memory_size) };
+        }
+        if !self.table_hva.is_null() && self.table_size > 0 {
+            // SAFETY: `table_hva` was returned by `libc::mmap` with `table_size`.
+            unsafe { libc::munmap(self.table_hva, self.table_size) };
+        }
+        if self.slot_fd >= 0 {
+            // SAFETY: `slot_fd` is owned by this struct.
+            unsafe { libc::close(self.slot_fd) };
+        }
+    }
+}
+
 struct MemoryMapping {
     addr: u64,
     size: usize,
@@ -1225,6 +1364,7 @@ struct MemoryMapping {
 
 pub struct VmOps {
     regions: Mutex<HashMap<u64, MemoryMapping>>,
+    l1_slots: Mutex<HashMap<u32, L1MemSlot>>,
     vcpus: Mutex<Vec<u64>>,
     shared_memory: Arc<VcpuSharedMemoryMapping>,
     has_irqchip: std::sync::atomic::AtomicBool,
@@ -1250,6 +1390,7 @@ impl VmOps {
     pub fn new() -> Self {
         VmOps {
             regions: Mutex::new(HashMap::new()),
+            l1_slots: Mutex::new(HashMap::new()),
             vcpus: Mutex::new(Vec::new()),
             shared_memory: Arc::new(VcpuSharedMemoryMapping::new()),
             has_irqchip: std::sync::atomic::AtomicBool::new(false),
@@ -2924,6 +3065,198 @@ impl VmOps {
     /// Binds the eventfd handle in `msg.arg` as this VM's run-completion
     /// notifier, so that a guest without a polling thread is told when a
     /// vCPU finishes KVM_RUN.
+    fn handle_set_l1_memslot(
+        &self,
+        handle: &Handle,
+        system: &Arc<System>,
+        msg: &Message,
+    ) -> Message {
+        #[repr(C)]
+        struct SetL1MemslotWire {
+            slot: u32,
+            flags: u32,
+            guest_phys_addr: u64,
+            memory_size: u64,
+            table_handle: u64,
+            table_size: u64,
+        }
+        if msg.body.len() != std::mem::size_of::<SetL1MemslotWire>() {
+            return Message::reply(msg).with_error(libc::EINVAL as u64);
+        }
+        // SAFETY: Checked exact size above; unaligned read handles any alignment.
+        let req = unsafe { std::ptr::read_unaligned(msg.body.as_ptr() as *const SetL1MemslotWire) };
+        let vm_fd = match handle.fd() {
+            Some(fd) => fd,
+            None => return Message::reply(msg).with_error(libc::EBADF as u64),
+        };
+
+        if req.memory_size == 0 {
+            let region = kvm::kvm_userspace_memory_region {
+                slot: req.slot,
+                flags: req.flags,
+                guest_phys_addr: req.guest_phys_addr,
+                memory_size: 0,
+                userspace_addr: 0,
+            };
+            // SAFETY: Valid `vm_fd` and `kvm_userspace_memory_region` struct.
+            let ret = unsafe { libc::ioctl(vm_fd, kvm::KVM_SET_USER_MEMORY_REGION as _, &region) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                return Message::reply(msg).with_error(err as u64);
+            }
+            if let Some(old) = self.l1_slots.lock().unwrap().remove(&req.slot) {
+                system.unregister_l1_fault_tag(old.tag);
+            }
+            return Message::reply(msg);
+        }
+
+        system.ensure_l1_fault_worker();
+
+        let tmem_fd = match system.tachyon_mem_fd() {
+            Ok(fd) => fd,
+            Err(e) => {
+                return Message::reply(msg)
+                    .with_error(e.raw_os_error().unwrap_or(libc::ENODEV) as u64);
+            }
+        };
+
+        let table_fd = match system.get_handle(req.table_handle).and_then(|h| h.fd()) {
+            Some(fd) => fd,
+            None => return Message::reply(msg).with_error(libc::EBADF as u64),
+        };
+
+        // SAFETY: Valid `table_fd` and `table_size` from RPC.
+        let table_hva = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                req.table_size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                table_fd,
+                0,
+            )
+        };
+        if table_hva == libc::MAP_FAILED {
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::ENOMEM);
+            return Message::reply(msg).with_error(err as u64);
+        }
+
+        let tag = system.register_l1_fault_tag(handle.id(), req.guest_phys_addr);
+        let create_req = TachyonMemCreateSlotEx {
+            size: req.memory_size,
+            table_hva: table_hva as u64,
+            table_size: req.table_size,
+            tag,
+        };
+        // SAFETY: Valid `tmem_fd` and `TachyonMemCreateSlotEx` pointer.
+        let slot_fd =
+            unsafe { ioctl::ioctl_with_ptr(&tmem_fd, TACHYON_MEM_CREATE_SLOT_EX(), &create_req) };
+        if slot_fd < 0 {
+            system.unregister_l1_fault_tag(tag);
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            // SAFETY: `table_hva` was just mapped above.
+            unsafe { libc::munmap(table_hva, req.table_size as usize) };
+            return Message::reply(msg).with_error(err as u64);
+        }
+
+        // SAFETY: `slot_fd` is a valid tachyon-mem slot fd.
+        let slot_hva = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                req.memory_size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                slot_fd,
+                0,
+            )
+        };
+        if slot_hva == libc::MAP_FAILED {
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::ENOMEM);
+            // SAFETY: `slot_fd` and `table_hva` were created above.
+            unsafe {
+                libc::close(slot_fd);
+                libc::munmap(table_hva, req.table_size as usize);
+            }
+            return Message::reply(msg).with_error(err as u64);
+        }
+
+        let region = kvm::kvm_userspace_memory_region {
+            slot: req.slot,
+            flags: req.flags,
+            guest_phys_addr: req.guest_phys_addr,
+            memory_size: req.memory_size,
+            userspace_addr: slot_hva as u64,
+        };
+        // SAFETY: `vm_fd` and `region` are valid; `slot_hva` stays mapped in `l1_slots`.
+        let ret = unsafe { libc::ioctl(vm_fd, kvm::KVM_SET_USER_MEMORY_REGION as _, &region) };
+        if ret < 0 {
+            system.unregister_l1_fault_tag(tag);
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            // SAFETY: Clean up mappings and fd created above.
+            unsafe {
+                libc::munmap(slot_hva, req.memory_size as usize);
+                libc::close(slot_fd);
+                libc::munmap(table_hva, req.table_size as usize);
+            }
+            return Message::reply(msg).with_error(err as u64);
+        }
+
+        let slot_obj = L1MemSlot {
+            slot_fd,
+            slot_hva,
+            memory_size: req.memory_size as usize,
+            table_hva,
+            table_size: req.table_size as usize,
+            tag,
+        };
+        if let Some(old) = self.l1_slots.lock().unwrap().insert(req.slot, slot_obj) {
+            system.unregister_l1_fault_tag(old.tag);
+        }
+        Message::reply(msg)
+    }
+
+    fn handle_invalidate_l1_memslot(&self, _handle: &Handle, msg: &Message) -> Message {
+        #[repr(C)]
+        struct InvalidateWire {
+            slot: u32,
+            pad: u32,
+            offset: u64,
+            size: u64,
+        }
+        if msg.body.len() != std::mem::size_of::<InvalidateWire>() {
+            return Message::reply(msg).with_error(libc::EINVAL as u64);
+        }
+        // SAFETY: Checked exact size above.
+        let req = unsafe { std::ptr::read_unaligned(msg.body.as_ptr() as *const InvalidateWire) };
+        let slots = self.l1_slots.lock().unwrap();
+        let Some(slot) = slots.get(&req.slot) else {
+            return Message::reply(msg).with_error(libc::ENOENT as u64);
+        };
+        let inv = TachyonMemInvalidate {
+            offset: req.offset,
+            size: req.size,
+        };
+        // SAFETY: `slot.slot_fd` is valid and `inv` is a stack struct.
+        let ret = unsafe { ioctl::ioctl_with_ptr(&slot.slot_fd, TACHYON_MEM_INVALIDATE(), &inv) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            return Message::reply(msg).with_error(err as u64);
+        }
+        Message::reply(msg)
+    }
+
     fn handle_set_run_notify(
         &self,
         handle: &Handle,
@@ -2989,6 +3322,8 @@ impl HandleOps for VmOps {
                 Some(resp)
             }
             Operation::SetRunNotify => Some(self.handle_set_run_notify(handle, system, msg)),
+            Operation::SetL1Memslot => Some(self.handle_set_l1_memslot(handle, system, msg)),
+            Operation::InvalidateL1Memslot => Some(self.handle_invalidate_l1_memslot(handle, msg)),
             _ => Some(Message::reply(msg).with_error(libc::ENOSYS as u64)),
         }
     }
@@ -3194,6 +3529,7 @@ impl HandleOps for VmOps {
 
         let vm_ops = Arc::new(VmOps {
             regions: Mutex::new(HashMap::new()),
+            l1_slots: Mutex::new(HashMap::new()),
             vcpus: Mutex::new(Vec::new()),
             shared_memory,
             has_irqchip: std::sync::atomic::AtomicBool::new(false),
@@ -3574,6 +3910,94 @@ impl KvmDeviceOps {
             eventfds: Mutex::new(Vec::new()),
         }
     }
+    fn handle_set_l1_memory(&self, system: &Arc<System>, msg: &Message) -> Message {
+        #[repr(C)]
+        struct RegionDescWire {
+            l1_gpa: u64,
+            size: u64,
+            fd_offset: u64,
+        }
+        let elem_sz = std::mem::size_of::<RegionDescWire>();
+        if !msg.body.len().is_multiple_of(elem_sz) {
+            return Message::reply(msg).with_error(libc::EINVAL as u64);
+        }
+        let count = msg.body.len() / elem_sz;
+        let fds = msg.fds.as_deref().unwrap_or(&[]);
+        if fds.len() != count {
+            for &fd in fds {
+                // SAFETY: Close unused received SCM_RIGHTS fds on error.
+                unsafe { libc::close(fd) };
+            }
+            return Message::reply(msg).with_error(libc::EINVAL as u64);
+        }
+
+        let tmem_fd = match system.tachyon_mem_fd() {
+            Ok(fd) => fd,
+            Err(e) => {
+                for &fd in fds {
+                    // SAFETY: Close unused received SCM_RIGHTS fds on error.
+                    unsafe { libc::close(fd) };
+                }
+                return Message::reply(msg)
+                    .with_error(e.raw_os_error().unwrap_or(libc::ENODEV) as u64);
+            }
+        };
+
+        let mut mappings = Vec::with_capacity(count);
+        let mut ioctl_regions = Vec::with_capacity(count);
+        for (i, &fd) in fds.iter().enumerate() {
+            // SAFETY: `i < count` and `msg.body` is `count * elem_sz` bytes.
+            let desc = unsafe {
+                std::ptr::read_unaligned(msg.body.as_ptr().add(i * elem_sz) as *const RegionDescWire)
+            };
+            // SAFETY: `fd` is a valid backing memory fd received via SCM_RIGHTS.
+            let addr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    desc.size as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    desc.fd_offset as libc::off_t,
+                )
+            };
+            // SAFETY: `mmap` retains a reference to the file; close the fd.
+            unsafe { libc::close(fd) };
+            if addr == libc::MAP_FAILED {
+                let err = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::ENOMEM);
+                return Message::reply(msg).with_error(err as u64);
+            }
+            mappings.push(L1MemoryMapping {
+                addr,
+                size: desc.size as usize,
+            });
+            ioctl_regions.push(TachyonMemL1Region {
+                l1_gpa: desc.l1_gpa,
+                size: desc.size,
+                hva: addr as u64,
+            });
+        }
+
+        let req = TachyonMemSetL1Regions {
+            count: ioctl_regions.len() as u32,
+            pad: 0,
+            regions_ptr: ioctl_regions.as_ptr() as u64,
+        };
+        // SAFETY: `tmem_fd` is valid and `ioctl_regions` lives across the ioctl.
+        let ret = unsafe { ioctl::ioctl_with_ptr(&tmem_fd, TACHYON_MEM_SET_L1_REGIONS(), &req) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            return Message::reply(msg).with_error(err as u64);
+        }
+
+        *system.l1_mappings.lock().unwrap() = mappings;
+        Message::reply(msg)
+    }
+
     fn handle_memory_file_create(
         &self,
         _handle: &Handle,
@@ -3744,6 +4168,7 @@ impl HandleOps for KvmDeviceOps {
             Operation::MemoryFileCreate => {
                 Some(self.handle_memory_file_create(handle, system, msg))
             }
+            Operation::SetL1Memory => Some(self.handle_set_l1_memory(system, msg)),
             Operation::OpenVfioContainer => {
                 Some(self.handle_open_vfio_container(handle, system, msg))
             }
@@ -3872,6 +4297,20 @@ pub struct System {
     state: std::sync::atomic::AtomicU32,
     rpc_thread_pool: Mutex<Option<Arc<rpc::RpcThreadPool>>>,
     config: Mutex<Option<Config>>,
+    tachyon_mem_fd: Mutex<Option<RawFd>>,
+    l1_mappings: Mutex<Vec<L1MemoryMapping>>,
+    l1_fault_tags: Mutex<HashMap<u64, (u64, u64)>>,
+    next_l1_fault_tag: std::sync::atomic::AtomicU64,
+    l1_fault_worker_started: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for System {
+    fn drop(&mut self) {
+        if let Some(fd) = *self.tachyon_mem_fd.lock().unwrap() {
+            // SAFETY: `fd` is owned by `System`.
+            unsafe { libc::close(fd) };
+        }
+    }
 }
 
 impl System {
@@ -3917,6 +4356,11 @@ impl System {
             state: std::sync::atomic::AtomicU32::new(SystemState::Running as u32),
             rpc_thread_pool: Mutex::new(None),
             config: Mutex::new(None),
+            tachyon_mem_fd: Mutex::new(None),
+            l1_mappings: Mutex::new(Vec::new()),
+            l1_fault_tags: Mutex::new(HashMap::new()),
+            next_l1_fault_tag: std::sync::atomic::AtomicU64::new(1),
+            l1_fault_worker_started: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -4017,6 +4461,11 @@ impl System {
             state: std::sync::atomic::AtomicU32::new(SystemState::Running as u32),
             rpc_thread_pool: Mutex::new(None),
             config: Mutex::new(None),
+            tachyon_mem_fd: Mutex::new(None),
+            l1_mappings: Mutex::new(Vec::new()),
+            l1_fault_tags: Mutex::new(HashMap::new()),
+            next_l1_fault_tag: std::sync::atomic::AtomicU64::new(1),
+            l1_fault_worker_started: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -4032,6 +4481,143 @@ impl System {
 
     pub fn set_config(&self, config: Option<Config>) {
         *self.config.lock().unwrap() = config;
+    }
+
+    fn register_l1_fault_tag(&self, vm_handle: u64, guest_phys_addr: u64) -> u64 {
+        let tag = self.next_l1_fault_tag.fetch_add(1, Ordering::Relaxed);
+        self.l1_fault_tags
+            .lock()
+            .unwrap()
+            .insert(tag, (vm_handle, guest_phys_addr));
+        tag
+    }
+
+    fn unregister_l1_fault_tag(&self, tag: u64) {
+        self.l1_fault_tags.lock().unwrap().remove(&tag);
+    }
+
+    fn ack_l1_fault(&self, seq: u64) {
+        if let Ok(tmem_fd) = self.tachyon_mem_fd() {
+            let ack = TachyonMemFaultReq {
+                tag: 0,
+                offset: 0,
+                seq,
+            };
+            // SAFETY: Valid `tmem_fd` and `TachyonMemFaultReq` pointer.
+            let ret = unsafe { ioctl::ioctl_with_ptr(&tmem_fd, TACHYON_MEM_ACK_FAULT(), &ack) };
+            if ret < 0 {
+                warn!(
+                    "System: TACHYON_MEM_ACK_FAULT failed for seq={}: {}",
+                    seq,
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    fn send_l1_fault_notification(&self, vm_handle: u64, gpa: u64, seq: u64) -> bool {
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&vm_handle.to_le_bytes());
+        body.extend_from_slice(&gpa.to_le_bytes());
+        body.extend_from_slice(&seq.to_le_bytes());
+
+        let msg = Message {
+            msg_type: Operation::FaultL1Page as u32,
+            request_id: 0,
+            handle: vm_handle,
+            status: 0,
+            arg: gpa,
+            cmd: 0,
+            resp_size: 0,
+            body,
+            fds: None,
+        };
+
+        let handles = self.handles.lock().unwrap();
+        let mut sent = false;
+        for h in handles.values() {
+            if let Some(ops) = h.ops.as_any().downcast_ref::<RpcChannelOps>()
+                && let Some(channel) = &*ops.channel.lock().unwrap()
+            {
+                match channel.send(&msg) {
+                    Ok(()) => sent = true,
+                    Err(e) => error!(
+                        "System: Failed to send FaultL1Page to handle 0x{:x}: {:?}",
+                        h.id, e
+                    ),
+                }
+            }
+        }
+        sent
+    }
+
+    fn ensure_l1_fault_worker(self: &Arc<Self>) {
+        if self
+            .l1_fault_worker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let system = self.clone();
+        std::thread::Builder::new()
+            .name("l1_fault_worker".to_string())
+            .spawn(move || {
+                let tmem_fd = match system.tachyon_mem_fd() {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        error!("l1_fault_worker: failed to open /dev/tachyon-mem: {e}");
+                        return;
+                    }
+                };
+                loop {
+                    let mut req = TachyonMemFaultReq {
+                        tag: 0,
+                        offset: 0,
+                        seq: 0,
+                    };
+                    // SAFETY: Valid `tmem_fd` and `TachyonMemFaultReq` pointer.
+                    let ret = unsafe {
+                        ioctl::ioctl_with_mut_ptr(&tmem_fd, TACHYON_MEM_GET_FAULT(), &mut req)
+                    };
+                    if ret < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        debug!("l1_fault_worker: TACHYON_MEM_GET_FAULT exiting: {err}");
+                        break;
+                    }
+                    let target = system.l1_fault_tags.lock().unwrap().get(&req.tag).copied();
+                    let sent = match target {
+                        Some((vm_handle, base_gpa)) => system.send_l1_fault_notification(
+                            vm_handle,
+                            base_gpa + req.offset,
+                            req.seq,
+                        ),
+                        None => false,
+                    };
+                    if !sent {
+                        system.ack_l1_fault(req.seq);
+                    }
+                }
+            })
+            .expect("Failed to spawn l1_fault_worker thread");
+    }
+
+    fn tachyon_mem_fd(&self) -> std::io::Result<RawFd> {
+        let mut guard = self.tachyon_mem_fd.lock().unwrap();
+        if let Some(fd) = *guard {
+            return Ok(fd);
+        }
+        let path = std::ffi::CString::new("/dev/tachyon-mem").unwrap();
+        // SAFETY: Valid NUL-terminated static string.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        *guard = Some(fd);
+        Ok(fd)
     }
 
     pub fn handle_channel(self: &Arc<Self>, channel: Arc<rpc::Channel>, handle_id: Option<u64>) {
@@ -4162,6 +4748,7 @@ impl System {
             && msg.msg_type != Operation::LiveUpdateRestore as u32
             && msg.msg_type != Operation::GetFileDescriptor as u32
             && msg.msg_type != Operation::Close as u32
+            && msg.msg_type != Operation::AckL1Fault as u32
         {
             debug!(
                 "System: Request type={} blocked because system is Paused",
@@ -4170,7 +4757,10 @@ impl System {
             return DispatchResult::Reply(Message::reply(msg).with_error(libc::EAGAIN as u64));
         }
 
-        if msg.msg_type == Operation::Pause as u32 {
+        if msg.msg_type == Operation::AckL1Fault as u32 {
+            self.ack_l1_fault(msg.arg);
+            return DispatchResult::Reply(Message::reply(msg));
+        } else if msg.msg_type == Operation::Pause as u32 {
             self.pause();
             return DispatchResult::Reply(Message::reply(msg));
         } else if msg.msg_type == Operation::Unpause as u32 {
