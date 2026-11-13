@@ -7,7 +7,7 @@
     clippy::field_reassign_with_default
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::FromRawFd;
@@ -38,7 +38,7 @@ use vm_device::UserspaceMapping;
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
-    MmapRegion,
+    GuestMemoryRegion, MmapRegion,
 };
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
@@ -215,6 +215,10 @@ enum Operation {
     FileIO,
     Ready,
     SetRunNotify,
+    SetL1Memslot,
+    InvalidateL1Memslot,
+    L1FaultPoll,
+    L1FaultAck,
     OpenVfioContainer,
     OpenVfioGroup,
     VfioGetGroups,
@@ -240,6 +244,10 @@ impl TryFrom<u64> for Operation {
             12 => Ok(Operation::FileIO),
             13 => Ok(Operation::Ready),
             14 => Ok(Operation::SetRunNotify),
+            15 => Ok(Operation::SetL1Memslot),
+            16 => Ok(Operation::InvalidateL1Memslot),
+            17 => Ok(Operation::L1FaultPoll),
+            18 => Ok(Operation::L1FaultAck),
             64 => Ok(Operation::OpenVfioContainer),
             65 => Ok(Operation::OpenVfioGroup),
             68 => Ok(Operation::VfioGetGroups),
@@ -534,10 +542,44 @@ impl VirtioInterrupt for NoopVirtioInterrupt {
 
 type MemFiles = HashMap<u64, KvmMemoryFile>;
 
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct VirtioKvmL1Fault {
+    vm_handle: u64,
+    gpa: u64,
+    seq: u64,
+}
+
+// SAFETY: `VirtioKvmL1Fault` is a plain `#[repr(C)]` struct of `u64` fields.
+unsafe impl ByteValued for VirtioKvmL1Fault {}
+
+#[derive(Copy, Clone)]
+struct PendingL1Fault {
+    vm_handle: u64,
+    gpa: u64,
+    seq: u64,
+}
+
+struct PendingL1FaultPoll {
+    head_index: u16,
+    resp_addr: GuestAddress,
+    fault_addr: GuestAddress,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    queue: QueueSync,
+    interrupt_cb: Arc<dyn VirtioInterrupt>,
+}
+
+#[derive(Default)]
+struct L1FaultState {
+    pending_faults: VecDeque<PendingL1Fault>,
+    pending_poll: Option<PendingL1FaultPoll>,
+}
+
 #[derive(Clone)]
 struct TachyonConnection {
     socket_dir: PathBuf,
     partitions: Arc<Mutex<HashMap<u64, TachyonPartition>>>,
+    l1_fault_state: Arc<Mutex<L1FaultState>>,
 }
 
 impl TachyonConnection {
@@ -546,11 +588,59 @@ impl TachyonConnection {
         TachyonConnection {
             socket_dir,
             partitions: Arc::new(Mutex::new(HashMap::new())),
+            l1_fault_state: Arc::new(Mutex::new(L1FaultState::default())),
         }
     }
 
     fn socket_for_partition(&self, partition_id: u64) -> PathBuf {
         self.socket_dir.join(format!("{partition_id}.sock"))
+    }
+
+    /// Sends the L1 guest RAM backing fds and GPA ranges to Tachyon so that
+    /// `/dev/tachyon-mem` can map L1-backed L2 memslots.
+    fn send_l1_memory(conn: &Arc<RpcClient>, mem_atomic: &GuestMemoryAtomic<GuestMemoryMmap>) {
+        #[repr(C)]
+        struct RegionDescWire {
+            l1_gpa: u64,
+            size: u64,
+            fd_offset: u64,
+        }
+        let mem = mem_atomic.memory();
+        let mut body = Vec::new();
+        let mut fds = Vec::new();
+        for region in mem.iter() {
+            let Some(fo) = region.file_offset() else {
+                continue;
+            };
+            let desc = RegionDescWire {
+                l1_gpa: region.start_addr().raw_value(),
+                size: region.len(),
+                fd_offset: fo.start(),
+            };
+            // SAFETY: `RegionDescWire` is `#[repr(C)]` plain data.
+            let bytes = unsafe {
+                slice::from_raw_parts(&desc as *const _ as *const u8, size_of::<RegionDescWire>())
+            };
+            body.extend_from_slice(bytes);
+            fds.push(fo.file().as_raw_fd());
+        }
+        if fds.is_empty() {
+            return;
+        }
+        let msg = Message::simple(TachyonOp::SetL1Memory as u32, 1)
+            .with_body(body)
+            .with_fds(fds);
+        match conn.call(msg) {
+            Ok(resp) if resp.status == 0 => {
+                info!("virtio-kvm: registered L1 backing memory with Tachyon");
+            }
+            Ok(resp) => {
+                warn!("virtio-kvm: SetL1Memory returned status {}", resp.status);
+            }
+            Err(e) => {
+                warn!("virtio-kvm: SetL1Memory RPC failed: {e}");
+            }
+        }
     }
 
     fn connect(socket_path: &PathBuf) -> io::Result<RpcClient> {
@@ -572,7 +662,35 @@ impl TachyonConnection {
         let handler_bar_mapping = virtio_kvm.bar_mapping.clone();
 
         conn.set_notification_handler(move |msg| {
-            if msg.msg_type == TachyonOp::NotifyLiveUpdate as u32 {
+            if msg.msg_type == TachyonOp::FaultL1Page as u32 && msg.body.len() >= 24 {
+                let tachyon_vm_handle = u64::from_le_bytes(msg.body[0..8].try_into().unwrap());
+                let gpa = u64::from_le_bytes(msg.body[8..16].try_into().unwrap());
+                let seq = u64::from_le_bytes(msg.body[16..24].try_into().unwrap());
+
+                let l1_vm_handle = {
+                    let resources = handler_resources.lock().unwrap();
+                    resources.iter().find_map(|(id, res)| {
+                        let guard = res.lock().unwrap();
+                        match &*guard {
+                            VirtioKvmResource::Vm(vm)
+                                if vm.tachyon_handle() == tachyon_vm_handle =>
+                            {
+                                Some(id.0)
+                            }
+                            _ => None,
+                        }
+                    })
+                };
+
+                match l1_vm_handle {
+                    Some(vm_handle) => {
+                        handler_tachyon.push_l1_fault(vm_handle, gpa, seq);
+                    }
+                    None => {
+                        handler_tachyon.ack_l1_fault(seq);
+                    }
+                }
+            } else if msg.msg_type == TachyonOp::NotifyLiveUpdate as u32 {
                 // Abort all pending requests so they can be retried with new resources
                 handler_tachyon.fail_pending_requests();
 
@@ -602,6 +720,65 @@ impl TachyonConnection {
         });
     }
 
+    fn complete_l1_fault_poll(mut poll: PendingL1FaultPoll, fault: PendingL1Fault) {
+        let wire = VirtioKvmL1Fault {
+            vm_handle: fault.vm_handle,
+            gpa: fault.gpa,
+            seq: fault.seq,
+        };
+        let mem = poll.mem.memory();
+        let resp = if mem.write_obj(wire, poll.fault_addr).is_ok() {
+            VirtioKvmResp::success()
+        } else {
+            VirtioKvmResp::from_errno(libc::EFAULT)
+        };
+        if let Err(e) = mem.write_obj(resp, poll.resp_addr) {
+            error!("virtio-kvm: failed to write L1FaultPoll resp: {e}");
+            return;
+        }
+        let mut q = poll.queue.lock();
+        if let Err(e) = q.add_used(&*mem, poll.head_index, size_of::<VirtioKvmResp>() as u32) {
+            error!("virtio-kvm: failed to add_used L1FaultPoll: {e}");
+            return;
+        }
+        if q.needs_notification(&*mem).unwrap_or(true)
+            && let Err(e) = poll.interrupt_cb.trigger(VirtioInterruptType::Queue(0))
+        {
+            error!("virtio-kvm: failed to trigger L1FaultPoll interrupt: {e}");
+        }
+    }
+
+    fn push_l1_fault(&self, vm_handle: u64, gpa: u64, seq: u64) {
+        let fault = PendingL1Fault {
+            vm_handle,
+            gpa,
+            seq,
+        };
+        let poll = {
+            let mut state = self.l1_fault_state.lock().unwrap();
+            if let Some(poll) = state.pending_poll.take() {
+                Some(poll)
+            } else {
+                state.pending_faults.push_back(fault);
+                None
+            }
+        };
+        if let Some(poll) = poll {
+            Self::complete_l1_fault_poll(poll, fault);
+        }
+    }
+
+    fn ack_l1_fault(&self, seq: u64) {
+        let partitions = self.partitions.lock().unwrap();
+        for p in partitions.values() {
+            let mut msg = Message::simple(TachyonOp::AckL1Fault as u32, 1);
+            msg.arg = seq;
+            if let Err(e) = p.client().call(msg) {
+                warn!("virtio-kvm: AckL1Fault RPC failed for seq={seq}: {e}");
+            }
+        }
+    }
+
     pub fn prepare_all_connections(&self, virtio_kvm: &VirtioKvmEpollHandler) {
         let partitions = self.partitions.lock().unwrap();
         for partition in partitions.values() {
@@ -622,6 +799,7 @@ impl TachyonConnection {
         let sock_path = self.socket_for_partition(partition_id);
         let new_conn = Arc::new(Self::connect(&sock_path)?);
         Self::prepare_connection(&new_conn, virtio_kvm);
+        Self::send_l1_memory(&new_conn, &virtio_kvm.mem);
         let partition = TachyonPartition::new(partition_id, new_conn);
         partitions.insert(partition_id, partition.clone());
         Ok(partition)
@@ -3384,6 +3562,42 @@ impl VirtioKvmEpollHandler {
         None
     }
 
+    fn handle_l1_fault_poll(
+        &self,
+        req: &VirtioKvmReq,
+        head_index: u16,
+        resp_addr: GuestAddress,
+    ) -> Option<VirtioKvmResp> {
+        let fault_addr = GuestAddress::new(req.longarg);
+        let mut state = self.tachyon.l1_fault_state.lock().unwrap();
+        if let Some(fault) = state.pending_faults.pop_front() {
+            let wire = VirtioKvmL1Fault {
+                vm_handle: fault.vm_handle,
+                gpa: fault.gpa,
+                seq: fault.seq,
+            };
+            let mem = self.mem.memory();
+            if mem.write_obj(wire, fault_addr).is_err() {
+                return Some(VirtioKvmResp::from_errno(libc::EFAULT));
+            }
+            return Some(VirtioKvmResp::success());
+        }
+        state.pending_poll = Some(PendingL1FaultPoll {
+            head_index,
+            resp_addr,
+            fault_addr,
+            mem: self.mem.clone(),
+            queue: self.queue.clone(),
+            interrupt_cb: self.interrupt_cb.clone(),
+        });
+        None
+    }
+
+    fn handle_l1_fault_ack(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
+        self.tachyon.ack_l1_fault(req.arg);
+        VirtioKvmResp::success()
+    }
+
     fn handle_memory_file_create(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
         let partition_id = req.arg;
         let partition = match self.tachyon.prepare_partition(self, partition_id) {
@@ -3788,6 +4002,143 @@ impl VirtioKvmEpollHandler {
         }
     }
 
+    fn handle_set_l1_memslot(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
+        #[repr(C, packed)]
+        #[derive(Copy, Clone)]
+        struct GuestL1MemslotReq {
+            slot: u32,
+            flags: u32,
+            guest_phys_addr: u64,
+            memory_size: u64,
+            table_bar_gpa: u64,
+            table_size: u64,
+        }
+        // SAFETY: Plain packed C struct with no invalid bit patterns.
+        unsafe impl vm_memory::ByteValued for GuestL1MemslotReq {}
+
+        #[repr(C)]
+        struct WireReq {
+            slot: u32,
+            flags: u32,
+            guest_phys_addr: u64,
+            memory_size: u64,
+            table_handle: u64,
+            table_size: u64,
+        }
+
+        let handle: Handle = req.handle;
+        let (tachyon_handle, partition) = {
+            let resource_map = self.resources.lock().unwrap();
+            match resource_map.get(&handle) {
+                Some(resource) => {
+                    let guard = resource.lock().unwrap();
+                    match guard.deref() {
+                        VirtioKvmResource::Vm(vm) => (vm.tachyon_handle(), vm.partition.clone()),
+                        _ => return VirtioKvmResp::from_errno(libc::EINVAL),
+                    }
+                }
+                None => return VirtioKvmResp::from_errno(libc::ENOENT),
+            }
+        };
+
+        let mem = self.mem.memory();
+        let greq: GuestL1MemslotReq = match mem.read_obj(GuestAddress::new(req.longarg)) {
+            Ok(r) => r,
+            Err(_) => return VirtioKvmResp::from_errno(libc::EFAULT),
+        };
+
+        let table_handle = if greq.memory_size > 0 {
+            match self.resolve_bar_resource(GuestAddress::new(greq.table_bar_gpa), greq.table_size)
+            {
+                Ok((h, _, _)) => h,
+                Err(e) => return e,
+            }
+        } else {
+            0
+        };
+
+        let wire = WireReq {
+            slot: greq.slot,
+            flags: greq.flags,
+            guest_phys_addr: greq.guest_phys_addr,
+            memory_size: greq.memory_size,
+            table_handle,
+            table_size: greq.table_size,
+        };
+        let mut body = vec![0u8; size_of::<WireReq>()];
+        // SAFETY: `WireReq` is `#[repr(C)]` plain data.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                &wire as *const _ as *const u8,
+                body.as_mut_ptr(),
+                body.len(),
+            );
+        }
+        let msg = Message::simple(TachyonOp::SetL1Memslot as u32, tachyon_handle).with_body(body);
+        match partition.call(msg) {
+            Ok(resp) if resp.status == 0 => VirtioKvmResp::success(),
+            Ok(resp) => VirtioKvmResp::from_errno(resp.status as i32),
+            Err(e) => {
+                error!("virtio-kvm: SetL1Memslot RPC failed: {e}");
+                VirtioKvmResp::from_errno(libc::EIO)
+            }
+        }
+    }
+
+    fn handle_invalidate_l1_memslot(&self, req: &VirtioKvmReq) -> VirtioKvmResp {
+        #[repr(C, packed)]
+        #[derive(Copy, Clone)]
+        struct GuestInvalidateReq {
+            slot: u32,
+            pad: u32,
+            offset: u64,
+            size: u64,
+        }
+        // SAFETY: Plain packed C struct with no invalid bit patterns.
+        unsafe impl vm_memory::ByteValued for GuestInvalidateReq {}
+
+        let handle: Handle = req.handle;
+        let (tachyon_handle, partition) = {
+            let resource_map = self.resources.lock().unwrap();
+            match resource_map.get(&handle) {
+                Some(resource) => {
+                    let guard = resource.lock().unwrap();
+                    match guard.deref() {
+                        VirtioKvmResource::Vm(vm) => (vm.tachyon_handle(), vm.partition.clone()),
+                        _ => return VirtioKvmResp::from_errno(libc::EINVAL),
+                    }
+                }
+                None => return VirtioKvmResp::from_errno(libc::ENOENT),
+            }
+        };
+
+        let mem = self.mem.memory();
+        let greq: GuestInvalidateReq = match mem.read_obj(GuestAddress::new(req.longarg)) {
+            Ok(r) => r,
+            Err(_) => return VirtioKvmResp::from_errno(libc::EFAULT),
+        };
+
+        let mut body = vec![0u8; size_of::<GuestInvalidateReq>()];
+        // SAFETY: `GuestInvalidateReq` is `#[repr(C, packed)]` plain data.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                &greq as *const _ as *const u8,
+                body.as_mut_ptr(),
+                body.len(),
+            );
+        }
+        let msg =
+            Message::simple(TachyonOp::InvalidateL1Memslot as u32, tachyon_handle).with_body(body);
+        match partition.call(msg) {
+            Ok(resp) if resp.status == 0 => VirtioKvmResp::success(),
+            Ok(resp) => VirtioKvmResp::from_errno(resp.status as i32),
+            Err(e) => {
+                error!("virtio-kvm: InvalidateL1Memslot RPC failed: {e}");
+                VirtioKvmResp::from_errno(libc::EIO)
+            }
+        }
+    }
+
     fn refresh_resources(&self) {
         info!("virtio-kvm: Refreshing resources after live-update");
         // 1. Refresh VM and VCPU FDs
@@ -3966,6 +4317,10 @@ impl VirtioKvmEpollHandler {
             Operation::FileIO => Some(self.handle_file_io(req)),
             Operation::Ready => Some(self.handle_ready(req)),
             Operation::SetRunNotify => Some(self.handle_set_run_notify(req)),
+            Operation::SetL1Memslot => Some(self.handle_set_l1_memslot(req)),
+            Operation::InvalidateL1Memslot => Some(self.handle_invalidate_l1_memslot(req)),
+            Operation::L1FaultPoll => self.handle_l1_fault_poll(req, head_index, resp_addr),
+            Operation::L1FaultAck => Some(self.handle_l1_fault_ack(req)),
             Operation::OpenVfioContainer => Some(self.handle_open_vfio_container(req)),
             Operation::OpenVfioGroup => Some(self.handle_open_vfio_group(req)),
             Operation::VfioGetGroups => Some(self.handle_vfio_get_groups(req)),
