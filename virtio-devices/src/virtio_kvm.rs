@@ -55,7 +55,7 @@ use crate::seccomp_filters::Thread;
 use crate::{GuestMemoryMmap, QueueSync, VirtioInterrupt, VirtioInterruptType};
 
 const QUEUE_SIZE: u16 = 256;
-const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
+const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE, QUEUE_SIZE];
 const VIRTIO_KVM_BAR_INDEX: usize = 4;
 
 // New descriptors are pending on the virtio queue.
@@ -561,6 +561,7 @@ struct PendingL1Fault {
 }
 
 struct PendingL1FaultPoll {
+    queue_idx: u16,
     head_index: u16,
     resp_addr: GuestAddress,
     fault_addr: GuestAddress,
@@ -572,7 +573,7 @@ struct PendingL1FaultPoll {
 #[derive(Default)]
 struct L1FaultState {
     pending_faults: VecDeque<PendingL1Fault>,
-    pending_poll: Option<PendingL1FaultPoll>,
+    pending_polls: VecDeque<PendingL1FaultPoll>,
 }
 
 #[derive(Clone)]
@@ -742,7 +743,9 @@ impl TachyonConnection {
             return;
         }
         if q.needs_notification(&*mem).unwrap_or(true)
-            && let Err(e) = poll.interrupt_cb.trigger(VirtioInterruptType::Queue(0))
+            && let Err(e) = poll
+                .interrupt_cb
+                .trigger(VirtioInterruptType::Queue(poll.queue_idx))
         {
             error!("virtio-kvm: failed to trigger L1FaultPoll interrupt: {e}");
         }
@@ -756,7 +759,7 @@ impl TachyonConnection {
         };
         let poll = {
             let mut state = self.l1_fault_state.lock().unwrap();
-            if let Some(poll) = state.pending_poll.take() {
+            if let Some(poll) = state.pending_polls.pop_front() {
                 Some(poll)
             } else {
                 state.pending_faults.push_back(fault);
@@ -3582,7 +3585,8 @@ impl VirtioKvmEpollHandler {
             }
             return Some(VirtioKvmResp::success());
         }
-        state.pending_poll = Some(PendingL1FaultPoll {
+        state.pending_polls.push_back(PendingL1FaultPoll {
+            queue_idx: 0,
             head_index,
             resp_addr,
             fault_addr,
@@ -4402,6 +4406,165 @@ impl VirtioKvmEpollHandler {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
+fn run_fault_queue_worker(
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    mut queue: QueueSync,
+    queue_evt: EventFd,
+    interrupt_cb: Arc<dyn VirtioInterrupt>,
+    tachyon: TachyonConnection,
+    kill_evt: EventFd,
+) {
+    let (ack_tx, ack_rx) = mpsc::channel::<(u64, u16, GuestAddress)>();
+    let ack_rx = Arc::new(Mutex::new(ack_rx));
+    let mut ack_threads = Vec::new();
+    for i in 0..4 {
+        let rx = ack_rx.clone();
+        let ack_tachyon = tachyon.clone();
+        let ack_mem = mem.clone();
+        let mut ack_queue = queue.clone();
+        let ack_cb = interrupt_cb.clone();
+        ack_threads.push(
+            thread::Builder::new()
+                .name(format!("virtio-kvm-ack-{i}"))
+                .spawn(move || {
+                    while let Ok((seq, head_index, resp_addr)) = rx.lock().unwrap().recv() {
+                        ack_tachyon.ack_l1_fault(seq);
+                        let m = ack_mem.memory();
+                        if m.write_obj(VirtioKvmResp::success(), resp_addr).is_ok() {
+                            let _ = ack_queue.add_used(
+                                &*m,
+                                head_index,
+                                size_of::<VirtioKvmResp>() as u32,
+                            );
+                            if ack_queue.needs_notification(&*m).unwrap_or(true) {
+                                let _ = ack_cb.trigger(VirtioInterruptType::Queue(1));
+                            }
+                        }
+                    }
+                })
+                .expect("Failed to spawn virtio-kvm-ack thread"),
+        );
+    }
+
+    let epoll_fd = epoll::create(true).unwrap();
+    let _ = epoll::ctl(
+        epoll_fd,
+        epoll::ControlOptions::EPOLL_CTL_ADD,
+        queue_evt.as_raw_fd(),
+        epoll::Event::new(epoll::Events::EPOLLIN, 1),
+    );
+    let _ = epoll::ctl(
+        epoll_fd,
+        epoll::ControlOptions::EPOLL_CTL_ADD,
+        kill_evt.as_raw_fd(),
+        epoll::Event::new(epoll::Events::EPOLLIN, 2),
+    );
+
+    let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 4];
+    'outer: loop {
+        let num_events = match epoll::wait(epoll_fd, -1, &mut events) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        for event in events.iter().take(num_events) {
+            if event.data == 2 {
+                break 'outer;
+            }
+            if event.data == 1 {
+                let _ = queue_evt.read();
+                let m = mem.memory();
+                let mut used_descs = false;
+                loop {
+                    if queue.disable_notification(&*m).is_err() {
+                        break 'outer;
+                    }
+                    while let Some(mut desc_chain) = queue.pop_descriptor_chain(&*m) {
+                        let Some(desc) = desc_chain.next() else {
+                            break;
+                        };
+                        if desc.is_write_only() || desc.len() as usize != size_of::<VirtioKvmReq>()
+                        {
+                            continue;
+                        }
+                        let Ok(req) = m.read_obj::<VirtioKvmReq>(desc.addr()) else {
+                            continue;
+                        };
+                        let head_index = desc_chain.head_index();
+                        let resp_addr = desc.addr().checked_add(desc.len().into()).unwrap();
+                        match Operation::try_from(req.operation) {
+                            Ok(Operation::L1FaultPoll) => {
+                                let fault_addr = GuestAddress::new(req.longarg);
+                                let mut state = tachyon.l1_fault_state.lock().unwrap();
+                                if let Some(fault) = state.pending_faults.pop_front() {
+                                    drop(state);
+                                    let wire = VirtioKvmL1Fault {
+                                        vm_handle: fault.vm_handle,
+                                        gpa: fault.gpa,
+                                        seq: fault.seq,
+                                    };
+                                    let resp = if m.write_obj(wire, fault_addr).is_ok() {
+                                        VirtioKvmResp::success()
+                                    } else {
+                                        VirtioKvmResp::from_errno(libc::EFAULT)
+                                    };
+                                    if m.write_obj(resp, resp_addr).is_ok() {
+                                        let _ = queue.add_used(
+                                            &*m,
+                                            head_index,
+                                            size_of::<VirtioKvmResp>() as u32,
+                                        );
+                                        used_descs = true;
+                                    }
+                                } else {
+                                    state.pending_polls.push_back(PendingL1FaultPoll {
+                                        queue_idx: 1,
+                                        head_index,
+                                        resp_addr,
+                                        fault_addr,
+                                        mem: mem.clone(),
+                                        queue: queue.clone(),
+                                        interrupt_cb: interrupt_cb.clone(),
+                                    });
+                                }
+                            }
+                            Ok(Operation::L1FaultAck) => {
+                                let _ = ack_tx.send((req.arg, head_index, resp_addr));
+                            }
+                            _ => {
+                                if m.write_obj(VirtioKvmResp::from_errno(libc::EINVAL), resp_addr)
+                                    .is_ok()
+                                {
+                                    let _ = queue.add_used(
+                                        &*m,
+                                        head_index,
+                                        size_of::<VirtioKvmResp>() as u32,
+                                    );
+                                    used_descs = true;
+                                }
+                            }
+                        }
+                    }
+                    if !queue.enable_notification(&*m).unwrap_or(false) {
+                        break;
+                    }
+                }
+                if used_descs && queue.needs_notification(&*m).unwrap_or(true) {
+                    let _ = interrupt_cb.trigger(VirtioInterruptType::Queue(1));
+                }
+            }
+        }
+    }
+
+    drop(ack_tx);
+    for t in ack_threads {
+        let _ = t.join();
+    }
+    // SAFETY: `epoll_fd` was created by `epoll::create` above.
+    unsafe { libc::close(epoll_fd) };
+}
+
 impl EpollHelperHandler for VirtioKvmEpollHandler {
     fn handle_event(
         &mut self,
@@ -5061,6 +5224,28 @@ impl VirtioDevice for VirtioKvm {
 
         let (_, queue, queue_evt) = queues.remove(0);
         let queue = QueueSync::from(queue);
+
+        if !queues.is_empty() {
+            let (_, fault_queue, fault_queue_evt) = queues.remove(0);
+            let fault_queue = QueueSync::from(fault_queue);
+            let fault_mem = mem.clone();
+            let fault_cb = interrupt_cb.clone();
+            let fault_tachyon = self.tachyon.clone();
+            let (fault_kill_evt, _) = self.common.dup_eventfds()?;
+            thread::Builder::new()
+                .name("virtio-kvm-faultq".to_string())
+                .spawn(move || {
+                    run_fault_queue_worker(
+                        fault_mem,
+                        fault_queue,
+                        fault_queue_evt,
+                        fault_cb,
+                        fault_tachyon,
+                        fault_kill_evt,
+                    );
+                })
+                .map_err(ActivateError::ThreadSpawn)?;
+        }
 
         let poll_fd = epoll::create(true).unwrap();
         let poll_wakeup_fd = EventFd::new(libc::EFD_CLOEXEC).unwrap();
