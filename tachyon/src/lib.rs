@@ -4559,50 +4559,52 @@ impl System {
         {
             return;
         }
-        let system = self.clone();
-        std::thread::Builder::new()
-            .name("l1_fault_worker".to_string())
-            .spawn(move || {
-                let tmem_fd = match system.tachyon_mem_fd() {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        error!("l1_fault_worker: failed to open /dev/tachyon-mem: {e}");
-                        return;
-                    }
-                };
-                loop {
-                    let mut req = TachyonMemFaultReq {
-                        tag: 0,
-                        offset: 0,
-                        seq: 0,
-                    };
-                    // SAFETY: Valid `tmem_fd` and `TachyonMemFaultReq` pointer.
-                    let ret = unsafe {
-                        ioctl::ioctl_with_mut_ptr(&tmem_fd, TACHYON_MEM_GET_FAULT(), &mut req)
-                    };
-                    if ret < 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.raw_os_error() == Some(libc::EINTR) {
-                            continue;
+        for i in 0..8 {
+            let system = self.clone();
+            std::thread::Builder::new()
+                .name(format!("l1_fault_worker_{i}"))
+                .spawn(move || {
+                    let tmem_fd = match system.tachyon_mem_fd() {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            error!("l1_fault_worker: failed to open /dev/tachyon-mem: {e}");
+                            return;
                         }
-                        debug!("l1_fault_worker: TACHYON_MEM_GET_FAULT exiting: {err}");
-                        break;
-                    }
-                    let target = system.l1_fault_tags.lock().unwrap().get(&req.tag).copied();
-                    let sent = match target {
-                        Some((vm_handle, base_gpa)) => system.send_l1_fault_notification(
-                            vm_handle,
-                            base_gpa + req.offset,
-                            req.seq,
-                        ),
-                        None => false,
                     };
-                    if !sent {
-                        system.ack_l1_fault(req.seq);
+                    loop {
+                        let mut req = TachyonMemFaultReq {
+                            tag: 0,
+                            offset: 0,
+                            seq: 0,
+                        };
+                        // SAFETY: Valid `tmem_fd` and `TachyonMemFaultReq` pointer.
+                        let ret = unsafe {
+                            ioctl::ioctl_with_mut_ptr(&tmem_fd, TACHYON_MEM_GET_FAULT(), &mut req)
+                        };
+                        if ret < 0 {
+                            let err = std::io::Error::last_os_error();
+                            if err.raw_os_error() == Some(libc::EINTR) {
+                                continue;
+                            }
+                            debug!("l1_fault_worker: TACHYON_MEM_GET_FAULT exiting: {err}");
+                            break;
+                        }
+                        let target = system.l1_fault_tags.lock().unwrap().get(&req.tag).copied();
+                        let sent = match target {
+                            Some((vm_handle, base_gpa)) => system.send_l1_fault_notification(
+                                vm_handle,
+                                base_gpa + req.offset,
+                                req.seq,
+                            ),
+                            None => false,
+                        };
+                        if !sent {
+                            system.ack_l1_fault(req.seq);
+                        }
                     }
-                }
-            })
-            .expect("Failed to spawn l1_fault_worker thread");
+                })
+                .expect("Failed to spawn l1_fault_worker thread");
+        }
     }
 
     fn tachyon_mem_fd(&self) -> std::io::Result<RawFd> {
